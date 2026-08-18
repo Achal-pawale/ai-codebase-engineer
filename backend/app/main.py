@@ -1,4 +1,3 @@
-
 from pydantic import BaseModel
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,11 +13,6 @@ import ast
 import json
 
 
-# ============================================================
-# ENVIRONMENT
-# ============================================================
-
-# .env is inside the backend folder
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 ENV_FILE = BACKEND_DIR / ".env"
 
@@ -26,7 +20,6 @@ load_dotenv(ENV_FILE)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Current stable Gemini model for this project
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
     "gemini-3.6-flash"
@@ -41,19 +34,9 @@ gemini_client = genai.Client(
     api_key=GEMINI_API_KEY
 )
 
-
-# ============================================================
-# FASTAPI
-# ============================================================
-
 app = FastAPI(
     title="AI Codebase Engineer"
 )
-
-
-# ============================================================
-# CORS
-# ============================================================
 
 app.add_middleware(
     CORSMiddleware,
@@ -62,13 +45,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
 WORKSPACE_DIR = BACKEND_DIR / "workspace"
 WORKSPACE_DIR.mkdir(exist_ok=True)
+
+# Chunks live here, NOT inside workspace/ — /ingest deletes and re-clones
+# repo folders on every run, which would silently wipe chunks.json if it
+# lived alongside the cloned code.
+DATA_DIR = BACKEND_DIR / "data"
+DATA_DIR.mkdir(exist_ok=True)
+
+
+def chunks_path_for(repo_path: Path) -> Path:
+    return DATA_DIR / f"{repo_path.name}_chunks.json"
 
 
 IGNORE_DIRS = {
@@ -95,10 +83,6 @@ CODE_EXTENSIONS = {
     ".cs",
 }
 
-
-# ============================================================
-# REQUEST MODELS
-# ============================================================
 
 class IngestRequest(BaseModel):
     repo_url: str
@@ -136,20 +120,12 @@ class AskRequest(BaseModel):
     top_k: int = 5
 
 
-# ============================================================
-# ROOT
-# ============================================================
-
 @app.get("/")
 def root():
     return {
         "message": "AI Codebase Engineer API is running."
     }
 
-
-# ============================================================
-# HEALTH
-# ============================================================
 
 @app.get("/health")
 def health_check():
@@ -158,18 +134,10 @@ def health_check():
     }
 
 
-# ============================================================
-# REMOVE READONLY FILES
-# ============================================================
-
 def remove_readonly(func, path, exc_info):
     os.chmod(path, stat.S_IWRITE)
     func(path)
 
-
-# ============================================================
-# INGEST
-# ============================================================
 
 @app.post("/ingest")
 def ingest_repo(req: IngestRequest):
@@ -231,10 +199,6 @@ def ingest_repo(req: IngestRequest):
         "file_count": file_count
     }
 
-
-# ============================================================
-# ANALYZE
-# ============================================================
 
 @app.post("/analyze")
 def analyze_repo(req: AnalyzeRequest):
@@ -345,10 +309,6 @@ def analyze_repo(req: AnalyzeRequest):
     }
 
 
-# ============================================================
-# CHUNK
-# ============================================================
-
 @app.post("/chunk")
 def chunk_repo(req: ChunkRequest):
 
@@ -388,7 +348,6 @@ def chunk_repo(req: ChunkRequest):
                 files_skipped += 1
                 continue
 
-            # Current AST chunking supports Python
             if extension != ".py":
                 files_skipped += 1
                 continue
@@ -407,10 +366,6 @@ def chunk_repo(req: ChunkRequest):
                 relative_path = file_path.relative_to(
                     repo_path
                 )
-
-                # ----------------------------------------
-                # IMPORTS
-                # ----------------------------------------
 
                 imports = []
 
@@ -437,10 +392,6 @@ def chunk_repo(req: ChunkRequest):
                 imports = sorted(
                     set(imports)
                 )
-
-                # ----------------------------------------
-                # FUNCTIONS / CLASSES
-                # ----------------------------------------
 
                 for node in ast.walk(tree):
 
@@ -485,10 +436,6 @@ def chunk_repo(req: ChunkRequest):
                     else:
 
                         structure_type = "function"
-
-                    # ----------------------------------------
-                    # REFERENCES
-                    # ----------------------------------------
 
                     references = []
 
@@ -559,11 +506,7 @@ def chunk_repo(req: ChunkRequest):
 
                 files_skipped += 1
 
-    # ----------------------------------------
-    # SAVE CHUNKS
-    # ----------------------------------------
-
-    chunks_file = repo_path / "chunks.json"
+    chunks_file = chunks_path_for(repo_path)
 
     with open(
         chunks_file,
@@ -612,10 +555,6 @@ def chunk_repo(req: ChunkRequest):
     }
 
 
-# ============================================================
-# RETRIEVE
-# ============================================================
-
 @app.post("/retrieve")
 def retrieve_chunks(req: RetrieveRequest):
     repo_path = Path(req.repo_path)
@@ -626,7 +565,7 @@ def retrieve_chunks(req: RetrieveRequest):
             "error": "Repository path doesn't exist."
         }
 
-    chunks_file = repo_path / "chunks.json"
+    chunks_file = chunks_path_for(repo_path)
 
     if not chunks_file.exists():
         return {
@@ -643,10 +582,6 @@ def retrieve_chunks(req: RetrieveRequest):
         }
 
     try:
-        # ----------------------------------------
-        # Load chunks
-        # ----------------------------------------
-
         with open(
             chunks_file,
             "r",
@@ -656,17 +591,9 @@ def retrieve_chunks(req: RetrieveRequest):
 
         chunks = data.get("chunks", [])
 
-        # ----------------------------------------
-        # Prepare query
-        # ----------------------------------------
-
         query_words = query.split()
 
         results = []
-
-        # ----------------------------------------
-        # Score every chunk
-        # ----------------------------------------
 
         for chunk in chunks:
 
@@ -720,21 +647,14 @@ def retrieve_chunks(req: RetrieveRequest):
             if not matched_words:
                 continue
 
-            # ----------------------------------------
-            # Relevance scoring
-            # ----------------------------------------
-
             score = 0
 
-            # 1. Exact name match
             if query == name:
                 score += 20
 
-            # 2. Query appears inside name
             elif query in name:
                 score += 12
 
-            # 3. Individual query words in name
             name_matches = sum(
                 1
                 for word in query_words
@@ -743,11 +663,9 @@ def retrieve_chunks(req: RetrieveRequest):
 
             score += name_matches * 8
 
-            # 4. Query appears in file path
             if query in file_path:
                 score += 10
 
-            # 5. Individual words in file path
             file_matches = sum(
                 1
                 for word in query_words
@@ -756,8 +674,6 @@ def retrieve_chunks(req: RetrieveRequest):
 
             score += file_matches * 4
 
-            # 6. References are more useful than
-            # random occurrences in large code blocks
             reference_matches = sum(
                 1
                 for word in query_words
@@ -766,7 +682,6 @@ def retrieve_chunks(req: RetrieveRequest):
 
             score += reference_matches * 5
 
-            # 7. Imports
             import_matches = sum(
                 1
                 for word in query_words
@@ -775,7 +690,6 @@ def retrieve_chunks(req: RetrieveRequest):
 
             score += import_matches * 3
 
-            # 8. Content matches
             content_matches = sum(
                 1
                 for word in query_words
@@ -783,10 +697,6 @@ def retrieve_chunks(req: RetrieveRequest):
             )
 
             score += content_matches
-
-            # ----------------------------------------
-            # Prefer focused structures
-            # ----------------------------------------
 
             if chunk_type in {
                 "function",
@@ -796,10 +706,6 @@ def retrieve_chunks(req: RetrieveRequest):
 
             elif chunk_type == "class":
                 score += 1
-
-            # ----------------------------------------
-            # Penalize huge chunks slightly
-            # ----------------------------------------
 
             start_line = chunk.get(
                 "start_line",
@@ -826,19 +732,11 @@ def retrieve_chunks(req: RetrieveRequest):
             elif line_count > 250:
                 score -= 3
 
-            # ----------------------------------------
-            # Save result
-            # ----------------------------------------
-
             results.append({
                 "score": score,
                 "matched_words": matched_words,
                 "chunk": chunk
             })
-
-        # ----------------------------------------
-        # Sort by relevance
-        # ----------------------------------------
 
         results.sort(
             key=lambda result: (
@@ -857,10 +755,6 @@ def retrieve_chunks(req: RetrieveRequest):
             ),
             reverse=True
         )
-
-        # ----------------------------------------
-        # Top K
-        # ----------------------------------------
 
         results = results[:req.top_k]
 
@@ -882,9 +776,6 @@ def retrieve_chunks(req: RetrieveRequest):
             "success": False,
             "error": str(e)
         }
-
-
-# `build_context_from_chunks()` helper
 
 
 def build_context_from_chunks(results):
@@ -917,10 +808,6 @@ CODE:
     return "\n---\n".join(context_parts)
 
 
-# ============================================================
-# CONTEXT
-# ============================================================
-
 @app.post("/context")
 def build_context(req: RetrieveRequest):
     repo_path = Path(req.repo_path)
@@ -931,7 +818,7 @@ def build_context(req: RetrieveRequest):
             "error": "Repository path doesn't exist."
         }
 
-    chunks_file = repo_path / "chunks.json"
+    chunks_file = chunks_path_for(repo_path)
 
     if not chunks_file.exists():
         return {
@@ -948,10 +835,6 @@ def build_context(req: RetrieveRequest):
         }
 
     try:
-        # ----------------------------------------
-        # Load persisted chunks
-        # ----------------------------------------
-
         with open(
             chunks_file,
             "r",
@@ -960,10 +843,6 @@ def build_context(req: RetrieveRequest):
             data = json.load(f)
 
         chunks = data.get("chunks", [])
-
-        # ----------------------------------------
-        # Retrieve relevant chunks
-        # ----------------------------------------
 
         query_lower = query.lower()
         query_words = query_lower.split()
@@ -996,10 +875,6 @@ def build_context(req: RetrieveRequest):
                 chunk.get("references", [])
             ).lower()
 
-            # ----------------------------------------
-            # Find matching query words
-            # ----------------------------------------
-
             matched_words = []
 
             for word in query_words:
@@ -1025,10 +900,6 @@ def build_context(req: RetrieveRequest):
 
             if not matched_words:
                 continue
-
-            # ----------------------------------------
-            # Relevance score
-            # ----------------------------------------
 
             score = 0
 
@@ -1081,7 +952,6 @@ def build_context(req: RetrieveRequest):
 
             score += content_matches
 
-            # Prefer focused structures
             if chunk_type in {
                 "function",
                 "async_function"
@@ -1091,7 +961,6 @@ def build_context(req: RetrieveRequest):
             elif chunk_type == "class":
                 score += 1
 
-            # Penalize extremely large chunks
             start_line = chunk.get(
                 "start_line",
                 0
@@ -1123,10 +992,6 @@ def build_context(req: RetrieveRequest):
                 "chunk": chunk
             })
 
-        # ----------------------------------------
-        # Sort by relevance
-        # ----------------------------------------
-
         results.sort(
             key=lambda result: (
                 result["score"],
@@ -1145,15 +1010,7 @@ def build_context(req: RetrieveRequest):
             reverse=True
         )
 
-        # ----------------------------------------
-        # Select top K
-        # ----------------------------------------
-
         results = results[:req.top_k]
-
-        # ----------------------------------------
-        # Build clean context
-        # ----------------------------------------
 
         context_parts = []
 
@@ -1228,10 +1085,6 @@ CODE:
             "\n\n".join(context_parts)
         )
 
-        # ----------------------------------------
-        # Return context
-        # ----------------------------------------
-
         return {
             "success": True,
             "query": req.query,
@@ -1252,11 +1105,6 @@ CODE:
         }
 
 
-
-# ============================================================
-# PROMPT
-# ============================================================
-
 @app.post("/prompt")
 def build_prompt(req: PromptRequest):
 
@@ -1270,7 +1118,7 @@ def build_prompt(req: PromptRequest):
                 "Repository path doesn't exist."
         }
 
-    chunks_file = repo_path / "chunks.json"
+    chunks_file = chunks_path_for(repo_path)
 
     if not chunks_file.exists():
 
@@ -1405,6 +1253,8 @@ Rules:
 - If the context does not contain enough information,
   clearly say so.
 - Mention relevant file names when useful.
+- When you reference code, cite it inline like (file.py, lines 10-15).
+- Clearly separate what the code shows (evidence) from anything you are inferring.
 - Explain the code clearly and concisely.
 
 USER QUESTION:
@@ -1445,10 +1295,6 @@ CODEBASE CONTEXT:
         }
 
 
-# ============================================================
-# ASK GEMINI
-# ============================================================
-
 @app.post("/ask")
 def ask_codebase(req: AskRequest):
 
@@ -1462,7 +1308,7 @@ def ask_codebase(req: AskRequest):
                 "Repository path doesn't exist."
         }
 
-    chunks_file = repo_path / "chunks.json"
+    chunks_file = chunks_path_for(repo_path)
 
     if not chunks_file.exists():
 
@@ -1484,10 +1330,6 @@ def ask_codebase(req: AskRequest):
 
     try:
 
-        # ----------------------------------------
-        # Load chunks
-        # ----------------------------------------
-
         with open(
             chunks_file,
             "r",
@@ -1500,10 +1342,6 @@ def ask_codebase(req: AskRequest):
             "chunks",
             []
         )
-
-        # ----------------------------------------
-        # Retrieve relevant chunks
-        # ----------------------------------------
 
         query = question.lower()
 
@@ -1572,15 +1410,7 @@ def ask_codebase(req: AskRequest):
             :req.top_k
         ]
 
-        # ----------------------------------------
-        # Build context
-        # ----------------------------------------
-
         context = build_context_from_chunks(results)
-
-        # ----------------------------------------
-        # Build prompt
-        # ----------------------------------------
 
         prompt = f"""You are an AI Codebase Engineer.
 
@@ -1593,6 +1423,8 @@ Rules:
 - If the context does not contain enough information,
   clearly say so.
 - Mention relevant file names when useful.
+- When you reference code, cite it inline like (file.py, lines 10-15).
+- Clearly separate what the code shows (evidence) from anything you are inferring.
 - Explain the code clearly and concisely.
 
 USER QUESTION:
@@ -1602,20 +1434,12 @@ CODEBASE CONTEXT:
 {context}
 """
 
-        # ----------------------------------------
-        # Gemini
-        # ----------------------------------------
-
         response = gemini_client.models.generate_content(
             model=GEMINI_MODEL,
             contents=prompt
         )
 
         answer = response.text
-
-        # ----------------------------------------
-        # Sources
-        # ----------------------------------------
 
         sources = [
             result["chunk"]["file"]
@@ -1657,3 +1481,293 @@ CODEBASE CONTEXT:
             "success": False,
             "error": str(e)
         }
+
+
+# ============================================================
+# RELATIONSHIPS (Day 8) — "where is this used?" / "what does
+# this depend on?" — answered entirely from data /chunk already
+# collected (imports + references per chunk). No new parsing.
+# ============================================================
+
+class RelationshipsRequest(BaseModel):
+    repo_path: str
+    name: str
+
+
+@app.post("/relationships")
+def get_relationships(req: RelationshipsRequest):
+
+    repo_path = Path(req.repo_path)
+
+    if not repo_path.exists():
+        return {
+            "success": False,
+            "error": "Repository path doesn't exist."
+        }
+
+    chunks_file = chunks_path_for(repo_path)
+
+    if not chunks_file.exists():
+        return {
+            "success": False,
+            "error": "chunks.json not found. Run /chunk first."
+        }
+
+    target_name = req.name.strip()
+
+    if not target_name:
+        return {
+            "success": False,
+            "error": "Name cannot be empty."
+        }
+
+    try:
+        with open(chunks_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError:
+        return {
+            "success": False,
+            "error": "chunks.json contains invalid JSON."
+        }
+
+    chunks = data.get("chunks", [])
+
+    # Where is target_name DEFINED? (there could be more than one,
+    # e.g. same function name in different files)
+    defined_at = [
+        {
+            "file": chunk.get("file"),
+            "type": chunk.get("type"),
+            "start_line": chunk.get("start_line"),
+            "end_line": chunk.get("end_line"),
+        }
+        for chunk in chunks
+        if chunk.get("name") == target_name
+    ]
+
+    # What does target_name's own code reference/import?
+    # (its "depends on" list)
+    depends_on = set()
+    for chunk in chunks:
+        if chunk.get("name") == target_name:
+            depends_on.update(chunk.get("references", []))
+            depends_on.update(chunk.get("imports", []))
+
+    # Which OTHER functions/classes reference target_name?
+    # (its "used by" list — the reverse direction)
+    used_by = []
+    for chunk in chunks:
+        if chunk.get("name") == target_name:
+            continue
+        if target_name in chunk.get("references", []):
+            used_by.append({
+                "name": chunk.get("name"),
+                "file": chunk.get("file"),
+                "type": chunk.get("type"),
+                "start_line": chunk.get("start_line"),
+                "end_line": chunk.get("end_line"),
+            })
+
+    # Which files import target_name as a module?
+    imported_in_files = sorted({
+        chunk.get("file")
+        for chunk in chunks
+        if target_name in chunk.get("imports", [])
+    })
+
+    return {
+        "success": True,
+        "name": target_name,
+        "defined_at": defined_at,
+        "depends_on": sorted(depends_on),
+        "used_by": used_by,
+        "imported_in_files": imported_in_files,
+    }
+
+
+# ============================================================
+# INVESTIGATE (Day 9) — turn a bug description into a structured
+# investigation. Combines /retrieve's approach (find relevant code)
+# with /relationships' data (what else touches that code), then
+# asks the model to reason about a likely cause, not just answer
+# a factual question.
+# ============================================================
+
+class InvestigateRequest(BaseModel):
+    repo_path: str
+    bug_description: str
+    top_k: int = 5
+
+
+@app.post("/investigate")
+def investigate_bug(req: InvestigateRequest):
+
+    repo_path = Path(req.repo_path)
+
+    if not repo_path.exists():
+        return {
+            "success": False,
+            "error": "Repository path doesn't exist."
+        }
+
+    chunks_file = chunks_path_for(repo_path)
+
+    if not chunks_file.exists():
+        return {
+            "success": False,
+            "error": "chunks.json not found. Run /chunk first."
+        }
+
+    bug_description = req.bug_description.strip()
+
+    if not bug_description:
+        return {
+            "success": False,
+            "error": "bug_description cannot be empty."
+        }
+
+    try:
+        with open(chunks_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError:
+        return {
+            "success": False,
+            "error": "chunks.json contains invalid JSON."
+        }
+
+    chunks = data.get("chunks", [])
+
+    # ---- Step 1: retrieve relevant chunks ----
+    query = bug_description.lower()
+    query_words = query.split()
+
+    results = []
+
+    for chunk in chunks:
+        searchable_text = " ".join([
+            str(chunk.get("name", "")),
+            str(chunk.get("type", "")),
+            str(chunk.get("file", "")),
+            str(chunk.get("content", "")),
+            " ".join(chunk.get("imports", [])),
+            " ".join(chunk.get("references", []))
+        ]).lower()
+
+        matched_words = [w for w in query_words if w in searchable_text]
+
+        if not matched_words:
+            continue
+
+        score = len(matched_words)
+        name = str(chunk.get("name", "")).lower()
+        if query in name:
+            score += 5
+        content = str(chunk.get("content", "")).lower()
+        if query in content:
+            score += 3
+
+        results.append({"score": score, "chunk": chunk})
+
+    results.sort(key=lambda r: r["score"], reverse=True)
+    results = results[:req.top_k]
+
+    if not results:
+        return {
+            "success": True,
+            "bug_description": bug_description,
+            "investigation": (
+                "No relevant code was found for this bug description. "
+                "Try describing it with terms more likely to appear in the "
+                "code (function names, error messages, feature names)."
+            ),
+            "retrieved_chunks": 0,
+            "related_symbols": [],
+            "sources": [],
+        }
+
+    # ---- Step 2: pull relationships for each retrieved chunk ----
+    related_notes = []
+    related_symbol_names = set()
+
+    for result in results:
+        chunk = result["chunk"]
+        name = chunk.get("name")
+
+        if not name or name in related_symbol_names:
+            continue
+        related_symbol_names.add(name)
+
+        used_by = [
+            c.get("name")
+            for c in chunks
+            if c.get("name") != name and name in c.get("references", [])
+        ]
+
+        if used_by:
+            related_notes.append(
+                f"{name} (in {chunk.get('file')}) is used by: "
+                f"{', '.join(sorted(set(used_by))[:5])}"
+            )
+
+    related_context = (
+        "\n".join(related_notes)
+        if related_notes
+        else "No cross-references found among the retrieved code."
+    )
+
+    # ---- Step 3: build context + prompt ----
+    context = build_context_from_chunks(results)
+
+    prompt = f"""You are an AI Codebase Engineer investigating a reported bug.
+
+Use ONLY the code shown below. Do not invent files, functions, or
+behavior that isn't shown. If the code doesn't support a conclusion,
+say so honestly instead of guessing.
+
+Respond in exactly this structure:
+
+SUSPECTED CAUSE:
+<your best hypothesis, or "Unable to determine from available code">
+
+EVIDENCE:
+<specific code supporting this, cited inline like (file.py, lines X-Y)>
+
+FILES TO CHECK NEXT:
+<a short list of files/functions worth investigating further, and why>
+
+CONFIDENCE:
+<High / Medium / Low, with a one-line reason>
+
+BUG DESCRIPTION:
+{bug_description}
+
+RELEVANT CODE:
+{context}
+
+CROSS-REFERENCES (what else touches this code):
+{related_context}
+"""
+
+    try:
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+        )
+        investigation = response.text
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"LLM call failed: {e}"
+        }
+
+    sources = sorted({result["chunk"]["file"] for result in results})
+
+    return {
+        "success": True,
+        "bug_description": bug_description,
+        "investigation": investigation,
+        "retrieved_chunks": len(results),
+        "related_symbols": sorted(related_symbol_names),
+        "sources": sources,
+        "model": GEMINI_MODEL,
+    }
