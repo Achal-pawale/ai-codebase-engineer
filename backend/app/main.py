@@ -12,7 +12,12 @@ import stat
 import ast
 import json
 import difflib
+import time
+import tempfile
 
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 ENV_FILE = BACKEND_DIR / ".env"
@@ -36,34 +41,49 @@ gemini_client = genai.Client(
 )
 
 
+# ============================================================
+# GEMINI
+# ============================================================
+
 def call_gemini_with_retry(prompt: str, max_retries: int = 3):
     """
     Calls Gemini, retrying with a short backoff on transient errors
-    (like 503 UNAVAILABLE from temporary high demand). Fails immediately
-    on anything else — a bad key or bad request will never succeed no
-    matter how many times you retry it.
+    like 503 UNAVAILABLE.
+
+    Fails immediately on non-transient errors.
     """
-    import time
 
     last_error = None
 
     for attempt in range(max_retries):
+
         try:
+
             return gemini_client.models.generate_content(
                 model=GEMINI_MODEL,
                 contents=prompt,
             )
+
         except Exception as e:
+
             last_error = e
             error_text = str(e)
 
-            if "503" not in error_text and "UNAVAILABLE" not in error_text:
+            if (
+                "503" not in error_text
+                and "UNAVAILABLE" not in error_text
+            ):
                 raise
 
             if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)  # 1s, then 2s
+                time.sleep(2 ** attempt)
 
     raise last_error
+
+
+# ============================================================
+# FASTAPI
+# ============================================================
 
 app = FastAPI(
     title="AI Codebase Engineer"
@@ -76,24 +96,28 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ============================================================
+# DIRECTORIES
+# ============================================================
+
 WORKSPACE_DIR = BACKEND_DIR / "workspace"
 WORKSPACE_DIR.mkdir(exist_ok=True)
 
-# Chunks live here, NOT inside workspace/ — /ingest deletes and re-clones
-# repo folders on every run, which would silently wipe chunks.json if it
-# lived alongside the cloned code.
 DATA_DIR = BACKEND_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
+
+PROPOSED_CHANGES_DIR = BACKEND_DIR / "proposed_changes"
+PROPOSED_CHANGES_DIR.mkdir(exist_ok=True)
 
 
 def chunks_path_for(repo_path: Path) -> Path:
     return DATA_DIR / f"{repo_path.name}_chunks.json"
 
-# Proposed code changes are saved here — NEVER written back into the
-# actual cloned repo. The AI proposes; a human applies, or doesn't.
-PROPOSED_CHANGES_DIR = BACKEND_DIR / "proposed_changes"
-PROPOSED_CHANGES_DIR.mkdir(exist_ok=True)
 
+# ============================================================
+# REPOSITORY CONFIGURATION
+# ============================================================
 
 IGNORE_DIRS = {
     ".git",
@@ -119,6 +143,19 @@ CODE_EXTENSIONS = {
     ".cs",
 }
 
+
+# ============================================================
+# DAY 12 TEST CONFIGURATION
+# ============================================================
+
+MAX_TEST_TIMEOUT = 300
+
+MAX_OUTPUT_SIZE = 50_000
+
+
+# ============================================================
+# REQUEST MODELS
+# ============================================================
 
 class IngestRequest(BaseModel):
     repo_url: str
@@ -156,6 +193,47 @@ class AskRequest(BaseModel):
     top_k: int = 5
 
 
+class RelationshipsRequest(BaseModel):
+    repo_path: str
+    name: str
+
+
+class InvestigateRequest(BaseModel):
+    repo_path: str
+    bug_description: str
+    top_k: int = 5
+
+
+class PlanRequest(BaseModel):
+    repo_path: str
+    feature_request: str
+    top_k: int = 5
+
+
+class ProposeChangeRequest(BaseModel):
+    repo_path: str
+    file_path: str
+    instruction: str
+
+
+# ============================================================
+# DAY 12 REQUEST MODELS
+# ============================================================
+
+class DetectTestsRequest(BaseModel):
+    repo_path: str
+
+
+class ValidateRequest(BaseModel):
+    repo_path: str
+    top_k: int = 5
+    timeout_seconds: int = 120
+
+
+# ============================================================
+# ROOT / HEALTH
+# ============================================================
+
 @app.get("/")
 def root():
     return {
@@ -169,6 +247,10 @@ def health_check():
         "status": "ok"
     }
 
+
+# ============================================================
+# INGEST
+# ============================================================
 
 def remove_readonly(func, path, exc_info):
     os.chmod(path, stat.S_IWRITE)
@@ -186,6 +268,7 @@ def ingest_repo(req: IngestRequest):
     dest = WORKSPACE_DIR / repo_name
 
     if dest.exists():
+
         shutil.rmtree(
             dest,
             onerror=remove_readonly
@@ -205,6 +288,7 @@ def ingest_repo(req: IngestRequest):
     )
 
     if result.returncode != 0:
+
         return {
             "success": False,
             "error": result.stderr
@@ -236,18 +320,24 @@ def ingest_repo(req: IngestRequest):
     }
 
 
+# ============================================================
+# ANALYZE
+# ============================================================
+
 @app.post("/analyze")
 def analyze_repo(req: AnalyzeRequest):
 
     repo_path = Path(req.cloned_to)
 
     if not repo_path.exists():
+
         return {
             "success": False,
             "error": "That path doesn't exist. Ingest the repo first."
         }
 
     if not repo_path.is_dir():
+
         return {
             "success": False,
             "error": "Repository path is not a directory."
@@ -345,25 +435,33 @@ def analyze_repo(req: AnalyzeRequest):
     }
 
 
+# ============================================================
+# CHUNK
+# ============================================================
+
 @app.post("/chunk")
 def chunk_repo(req: ChunkRequest):
 
     repo_path = Path(req.repo_path)
 
     if not repo_path.exists():
+
         return {
             "success": False,
             "error": "Repository path doesn't exist."
         }
 
     if not repo_path.is_dir():
+
         return {
             "success": False,
             "error": "Repository path is not a directory."
         }
 
     all_chunks = []
+
     files_processed = 0
+
     files_skipped = 0
 
     for root, dirs, files in os.walk(repo_path):
@@ -381,10 +479,12 @@ def chunk_repo(req: ChunkRequest):
             extension = file_path.suffix.lower()
 
             if extension not in CODE_EXTENSIONS:
+
                 files_skipped += 1
                 continue
 
             if extension != ".py":
+
                 files_skipped += 1
                 continue
 
@@ -591,11 +691,17 @@ def chunk_repo(req: ChunkRequest):
     }
 
 
+# ============================================================
+# RETRIEVE
+# ============================================================
+
 @app.post("/retrieve")
 def retrieve_chunks(req: RetrieveRequest):
+
     repo_path = Path(req.repo_path)
 
     if not repo_path.exists():
+
         return {
             "success": False,
             "error": "Repository path doesn't exist."
@@ -604,6 +710,7 @@ def retrieve_chunks(req: RetrieveRequest):
     chunks_file = chunks_path_for(repo_path)
 
     if not chunks_file.exists():
+
         return {
             "success": False,
             "error": "chunks.json not found. Run /chunk first."
@@ -612,17 +719,20 @@ def retrieve_chunks(req: RetrieveRequest):
     query = req.query.strip().lower()
 
     if not query:
+
         return {
             "success": False,
             "error": "Query cannot be empty."
         }
 
     try:
+
         with open(
             chunks_file,
             "r",
             encoding="utf-8"
         ) as f:
+
             data = json.load(f)
 
         chunks = data.get("chunks", [])
@@ -738,9 +848,11 @@ def retrieve_chunks(req: RetrieveRequest):
                 "function",
                 "async_function"
             }:
+
                 score += 2
 
             elif chunk_type == "class":
+
                 score += 1
 
             start_line = chunk.get(
@@ -754,12 +866,15 @@ def retrieve_chunks(req: RetrieveRequest):
             )
 
             try:
+
                 line_count = (
                     int(end_line)
                     - int(start_line)
                     + 1
                 )
+
             except Exception:
+
                 line_count = 1
 
             if line_count > 500:
@@ -802,22 +917,30 @@ def retrieve_chunks(req: RetrieveRequest):
         }
 
     except json.JSONDecodeError:
+
         return {
             "success": False,
             "error": "chunks.json contains invalid JSON."
         }
 
     except Exception as e:
+
         return {
             "success": False,
             "error": str(e)
         }
 
 
+# ============================================================
+# CONTEXT HELPER
+# ============================================================
+
 def build_context_from_chunks(results):
+
     context_parts = []
 
     for result in results:
+
         chunk = result["chunk"]
 
         context_parts.append(
@@ -839,16 +962,28 @@ CODE:
         )
 
     if not context_parts:
-        return "No relevant code was found for this question."
 
-    return "\n---\n".join(context_parts)
+        return (
+            "No relevant code was found "
+            "for this question."
+        )
 
+    return "\n---\n".join(
+        context_parts
+    )
+
+
+# ============================================================
+# CONTEXT
+# ============================================================
 
 @app.post("/context")
 def build_context(req: RetrieveRequest):
+
     repo_path = Path(req.repo_path)
 
     if not repo_path.exists():
+
         return {
             "success": False,
             "error": "Repository path doesn't exist."
@@ -857,6 +992,7 @@ def build_context(req: RetrieveRequest):
     chunks_file = chunks_path_for(repo_path)
 
     if not chunks_file.exists():
+
         return {
             "success": False,
             "error": "chunks.json not found. Run /chunk first."
@@ -865,22 +1001,26 @@ def build_context(req: RetrieveRequest):
     query = req.query.strip()
 
     if not query:
+
         return {
             "success": False,
             "error": "Query cannot be empty."
         }
 
     try:
+
         with open(
             chunks_file,
             "r",
             encoding="utf-8"
         ) as f:
+
             data = json.load(f)
 
         chunks = data.get("chunks", [])
 
         query_lower = query.lower()
+
         query_words = query_lower.split()
 
         results = []
@@ -992,9 +1132,11 @@ def build_context(req: RetrieveRequest):
                 "function",
                 "async_function"
             }:
+
                 score += 2
 
             elif chunk_type == "class":
+
                 score += 1
 
             start_line = chunk.get(
@@ -1008,12 +1150,15 @@ def build_context(req: RetrieveRequest):
             )
 
             try:
+
                 line_count = (
                     int(end_line)
                     - int(start_line)
                     + 1
                 )
+
             except Exception:
+
                 line_count = 1
 
             if line_count > 500:
@@ -1054,71 +1199,26 @@ def build_context(req: RetrieveRequest):
 
             chunk = result["chunk"]
 
-            file_path = chunk.get(
-                "file",
-                ""
-            )
-
-            language = chunk.get(
-                "language",
-                ""
-            )
-
-            chunk_type = chunk.get(
-                "type",
-                ""
-            )
-
-            name = chunk.get(
-                "name",
-                ""
-            )
-
-            start_line = chunk.get(
-                "start_line",
-                ""
-            )
-
-            end_line = chunk.get(
-                "end_line",
-                ""
-            )
-
-            imports = chunk.get(
-                "imports",
-                []
-            )
-
-            references = chunk.get(
-                "references",
-                []
-            )
-
-            content = chunk.get(
-                "content",
-                ""
-            )
-
-            part = f"""FILE: {file_path}
-LANGUAGE: {language}
-TYPE: {chunk_type}
-NAME: {name}
-LINES: {start_line}-{end_line}
+            part = f"""FILE: {chunk.get("file")}
+LANGUAGE: {chunk.get("language")}
+TYPE: {chunk.get("type")}
+NAME: {chunk.get("name")}
+LINES: {chunk.get("start_line")}-{chunk.get("end_line")}
 
 IMPORTS:
-{", ".join(imports)}
+{", ".join(chunk.get("imports", []))}
 
 REFERENCES:
-{", ".join(references)}
+{", ".join(chunk.get("references", []))}
 
 CODE:
-{content}
+{chunk.get("content")}
 """
 
             context_parts.append(part)
 
-        context = "\n\n" + (
-            "\n\n".join(context_parts)
+        context = "\n\n".join(
+            context_parts
         )
 
         return {
@@ -1129,17 +1229,23 @@ CODE:
         }
 
     except json.JSONDecodeError:
+
         return {
             "success": False,
             "error": "chunks.json contains invalid JSON."
         }
 
     except Exception as e:
+
         return {
             "success": False,
             "error": str(e)
         }
 
+
+# ============================================================
+# PROMPT
+# ============================================================
 
 @app.post("/prompt")
 def build_prompt(req: PromptRequest):
@@ -1150,8 +1256,7 @@ def build_prompt(req: PromptRequest):
 
         return {
             "success": False,
-            "error":
-                "Repository path doesn't exist."
+            "error": "Repository path doesn't exist."
         }
 
     chunks_file = chunks_path_for(repo_path)
@@ -1160,8 +1265,7 @@ def build_prompt(req: PromptRequest):
 
         return {
             "success": False,
-            "error":
-                "chunks.json not found. Run /chunk first."
+            "error": "chunks.json not found. Run /chunk first."
         }
 
     question = req.question.strip()
@@ -1170,8 +1274,7 @@ def build_prompt(req: PromptRequest):
 
         return {
             "success": False,
-            "error":
-                "Question cannot be empty."
+            "error": "Question cannot be empty."
         }
 
     try:
@@ -1238,12 +1341,8 @@ def build_prompt(req: PromptRequest):
                 score += 3
 
             results.append({
-
-                "score":
-                    score,
-
-                "chunk":
-                    chunk
+                "score": score,
+                "chunk": chunk
             })
 
         results.sort(
@@ -1252,9 +1351,7 @@ def build_prompt(req: PromptRequest):
             reverse=True
         )
 
-        results = results[
-            :req.top_k
-        ]
+        results = results[:req.top_k]
 
         context_parts = []
 
@@ -1301,26 +1398,17 @@ CODEBASE CONTEXT:
 """
 
         return {
-
-            "success":
-                True,
-
-            "question":
-                req.question,
-
-            "retrieved_chunks":
-                len(results),
-
-            "prompt":
-                prompt
+            "success": True,
+            "question": req.question,
+            "retrieved_chunks": len(results),
+            "prompt": prompt
         }
 
     except json.JSONDecodeError:
 
         return {
             "success": False,
-            "error":
-                "chunks.json contains invalid JSON."
+            "error": "chunks.json contains invalid JSON."
         }
 
     except Exception as e:
@@ -1331,6 +1419,10 @@ CODEBASE CONTEXT:
         }
 
 
+# ============================================================
+# ASK
+# ============================================================
+
 @app.post("/ask")
 def ask_codebase(req: AskRequest):
 
@@ -1340,8 +1432,7 @@ def ask_codebase(req: AskRequest):
 
         return {
             "success": False,
-            "error":
-                "Repository path doesn't exist."
+            "error": "Repository path doesn't exist."
         }
 
     chunks_file = chunks_path_for(repo_path)
@@ -1350,8 +1441,7 @@ def ask_codebase(req: AskRequest):
 
         return {
             "success": False,
-            "error":
-                "chunks.json not found. Run /chunk first."
+            "error": "chunks.json not found. Run /chunk first."
         }
 
     question = req.question.strip()
@@ -1360,8 +1450,7 @@ def ask_codebase(req: AskRequest):
 
         return {
             "success": False,
-            "error":
-                "Question cannot be empty."
+            "error": "Question cannot be empty."
         }
 
     try:
@@ -1428,12 +1517,8 @@ def ask_codebase(req: AskRequest):
                 score += 3
 
             results.append({
-
-                "score":
-                    score,
-
-                "chunk":
-                    chunk
+                "score": score,
+                "chunk": chunk
             })
 
         results.sort(
@@ -1442,11 +1527,11 @@ def ask_codebase(req: AskRequest):
             reverse=True
         )
 
-        results = results[
-            :req.top_k
-        ]
+        results = results[:req.top_k]
 
-        context = build_context_from_chunks(results)
+        context = build_context_from_chunks(
+            results
+        )
 
         prompt = f"""You are an AI Codebase Engineer.
 
@@ -1470,7 +1555,9 @@ CODEBASE CONTEXT:
 {context}
 """
 
-        response = call_gemini_with_retry(prompt)
+        response = call_gemini_with_retry(
+            prompt
+        )
 
         answer = response.text
 
@@ -1512,20 +1599,14 @@ CODEBASE CONTEXT:
 
         return {
             "success": False,
-            "error": str(e)
+            "error":
+                str(e)
         }
 
 
 # ============================================================
-# RELATIONSHIPS (Day 8) — "where is this used?" / "what does
-# this depend on?" — answered entirely from data /chunk already
-# collected (imports + references per chunk). No new parsing.
+# RELATIONSHIPS
 # ============================================================
-
-class RelationshipsRequest(BaseModel):
-    repo_path: str
-    name: str
-
 
 @app.post("/relationships")
 def get_relationships(req: RelationshipsRequest):
@@ -1533,6 +1614,7 @@ def get_relationships(req: RelationshipsRequest):
     repo_path = Path(req.repo_path)
 
     if not repo_path.exists():
+
         return {
             "success": False,
             "error": "Repository path doesn't exist."
@@ -1541,6 +1623,7 @@ def get_relationships(req: RelationshipsRequest):
     chunks_file = chunks_path_for(repo_path)
 
     if not chunks_file.exists():
+
         return {
             "success": False,
             "error": "chunks.json not found. Run /chunk first."
@@ -1549,24 +1632,34 @@ def get_relationships(req: RelationshipsRequest):
     target_name = req.name.strip()
 
     if not target_name:
+
         return {
             "success": False,
             "error": "Name cannot be empty."
         }
 
     try:
-        with open(chunks_file, "r", encoding="utf-8") as f:
+
+        with open(
+            chunks_file,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
             data = json.load(f)
+
     except json.JSONDecodeError:
+
         return {
             "success": False,
             "error": "chunks.json contains invalid JSON."
         }
 
-    chunks = data.get("chunks", [])
+    chunks = data.get(
+        "chunks",
+        []
+    )
 
-    # Where is target_name DEFINED? (there could be more than one,
-    # e.g. same function name in different files)
     defined_at = [
         {
             "file": chunk.get("file"),
@@ -1578,21 +1671,38 @@ def get_relationships(req: RelationshipsRequest):
         if chunk.get("name") == target_name
     ]
 
-    # What does target_name's own code reference/import?
-    # (its "depends on" list)
     depends_on = set()
-    for chunk in chunks:
-        if chunk.get("name") == target_name:
-            depends_on.update(chunk.get("references", []))
-            depends_on.update(chunk.get("imports", []))
 
-    # Which OTHER functions/classes reference target_name?
-    # (its "used by" list — the reverse direction)
-    used_by = []
     for chunk in chunks:
+
+        if chunk.get("name") == target_name:
+
+            depends_on.update(
+                chunk.get(
+                    "references",
+                    []
+                )
+            )
+
+            depends_on.update(
+                chunk.get(
+                    "imports",
+                    []
+                )
+            )
+
+    used_by = []
+
+    for chunk in chunks:
+
         if chunk.get("name") == target_name:
             continue
-        if target_name in chunk.get("references", []):
+
+        if target_name in chunk.get(
+            "references",
+            []
+        ):
+
             used_by.append({
                 "name": chunk.get("name"),
                 "file": chunk.get("file"),
@@ -1601,36 +1711,30 @@ def get_relationships(req: RelationshipsRequest):
                 "end_line": chunk.get("end_line"),
             })
 
-    # Which files import target_name as a module?
     imported_in_files = sorted({
         chunk.get("file")
         for chunk in chunks
-        if target_name in chunk.get("imports", [])
+        if target_name in chunk.get(
+            "imports",
+            []
+        )
     })
 
     return {
         "success": True,
         "name": target_name,
         "defined_at": defined_at,
-        "depends_on": sorted(depends_on),
+        "depends_on": sorted(
+            depends_on
+        ),
         "used_by": used_by,
         "imported_in_files": imported_in_files,
     }
 
 
 # ============================================================
-# INVESTIGATE (Day 9) — turn a bug description into a structured
-# investigation. Combines /retrieve's approach (find relevant code)
-# with /relationships' data (what else touches that code), then
-# asks the model to reason about a likely cause, not just answer
-# a factual question.
+# INVESTIGATE
 # ============================================================
-
-class InvestigateRequest(BaseModel):
-    repo_path: str
-    bug_description: str
-    top_k: int = 5
-
 
 @app.post("/investigate")
 def investigate_bug(req: InvestigateRequest):
@@ -1638,6 +1742,7 @@ def investigate_bug(req: InvestigateRequest):
     repo_path = Path(req.repo_path)
 
     if not repo_path.exists():
+
         return {
             "success": False,
             "error": "Repository path doesn't exist."
@@ -1646,6 +1751,7 @@ def investigate_bug(req: InvestigateRequest):
     chunks_file = chunks_path_for(repo_path)
 
     if not chunks_file.exists():
+
         return {
             "success": False,
             "error": "chunks.json not found. Run /chunk first."
@@ -1654,102 +1760,152 @@ def investigate_bug(req: InvestigateRequest):
     bug_description = req.bug_description.strip()
 
     if not bug_description:
+
         return {
             "success": False,
             "error": "bug_description cannot be empty."
         }
 
     try:
-        with open(chunks_file, "r", encoding="utf-8") as f:
+
+        with open(
+            chunks_file,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
             data = json.load(f)
+
     except json.JSONDecodeError:
+
         return {
             "success": False,
             "error": "chunks.json contains invalid JSON."
         }
 
-    chunks = data.get("chunks", [])
+    chunks = data.get(
+        "chunks",
+        []
+    )
 
-    # ---- Step 1: retrieve relevant chunks ----
     query = bug_description.lower()
+
     query_words = query.split()
 
     results = []
 
     for chunk in chunks:
+
         searchable_text = " ".join([
             str(chunk.get("name", "")),
             str(chunk.get("type", "")),
             str(chunk.get("file", "")),
             str(chunk.get("content", "")),
-            " ".join(chunk.get("imports", [])),
-            " ".join(chunk.get("references", []))
+            " ".join(
+                chunk.get("imports", [])
+            ),
+            " ".join(
+                chunk.get("references", [])
+            )
         ]).lower()
 
-        matched_words = [w for w in query_words if w in searchable_text]
+        matched_words = [
+            w
+            for w in query_words
+            if w in searchable_text
+        ]
 
         if not matched_words:
             continue
 
-        score = len(matched_words)
-        name = str(chunk.get("name", "")).lower()
+        score = len(
+            matched_words
+        )
+
+        name = str(
+            chunk.get("name", "")
+        ).lower()
+
         if query in name:
             score += 5
-        content = str(chunk.get("content", "")).lower()
+
+        content = str(
+            chunk.get("content", "")
+        ).lower()
+
         if query in content:
             score += 3
 
-        results.append({"score": score, "chunk": chunk})
+        results.append({
+            "score": score,
+            "chunk": chunk
+        })
 
-    results.sort(key=lambda r: r["score"], reverse=True)
+    results.sort(
+        key=lambda r: r["score"],
+        reverse=True
+    )
+
     results = results[:req.top_k]
 
     if not results:
+
         return {
             "success": True,
             "bug_description": bug_description,
             "investigation": (
                 "No relevant code was found for this bug description. "
-                "Try describing it with terms more likely to appear in the "
-                "code (function names, error messages, feature names)."
+                "Try describing it with terms more likely to appear in "
+                "the code (function names, error messages, feature names)."
             ),
             "retrieved_chunks": 0,
             "related_symbols": [],
             "sources": [],
         }
 
-    # ---- Step 2: pull relationships for each retrieved chunk ----
     related_notes = []
+
     related_symbol_names = set()
 
     for result in results:
+
         chunk = result["chunk"]
+
         name = chunk.get("name")
 
         if not name or name in related_symbol_names:
             continue
+
         related_symbol_names.add(name)
 
         used_by = [
             c.get("name")
             for c in chunks
-            if c.get("name") != name and name in c.get("references", [])
+            if c.get("name") != name
+            and name in c.get(
+                "references",
+                []
+            )
         ]
 
         if used_by:
+
             related_notes.append(
-                f"{name} (in {chunk.get('file')}) is used by: "
+                f"{name} (in {chunk.get('file')}) "
+                f"is used by: "
                 f"{', '.join(sorted(set(used_by))[:5])}"
             )
 
     related_context = (
         "\n".join(related_notes)
         if related_notes
-        else "No cross-references found among the retrieved code."
+        else
+        "No cross-references found among the retrieved code."
     )
 
-    # ---- Step 3: build context + prompt ----
-    context = build_context_from_chunks(results)
+    context = build_context_from_chunks(
+        results
+    )
 
     prompt = f"""You are an AI Codebase Engineer investigating a reported bug.
 
@@ -1782,39 +1938,41 @@ CROSS-REFERENCES (what else touches this code):
 """
 
     try:
-        response = call_gemini_with_retry(prompt)
+
+        response = call_gemini_with_retry(
+            prompt
+        )
+
         investigation = response.text
+
     except Exception as e:
+
         return {
             "success": False,
             "error": f"LLM call failed: {e}"
         }
 
-    sources = sorted({result["chunk"]["file"] for result in results})
+    sources = sorted({
+        result["chunk"]["file"]
+        for result in results
+    })
 
     return {
         "success": True,
         "bug_description": bug_description,
         "investigation": investigation,
         "retrieved_chunks": len(results),
-        "related_symbols": sorted(related_symbol_names),
+        "related_symbols": sorted(
+            related_symbol_names
+        ),
         "sources": sources,
         "model": GEMINI_MODEL,
     }
 
 
 # ============================================================
-# PLAN (Day 10) — turn a feature request into a concrete plan
-# BEFORE any code is written. Same retrieval + relationships
-# approach as /investigate, aimed at "what should I build"
-# instead of "what's broken."
+# PLAN
 # ============================================================
-
-class PlanRequest(BaseModel):
-    repo_path: str
-    feature_request: str
-    top_k: int = 5
-
 
 @app.post("/plan")
 def plan_feature(req: PlanRequest):
@@ -1822,6 +1980,7 @@ def plan_feature(req: PlanRequest):
     repo_path = Path(req.repo_path)
 
     if not repo_path.exists():
+
         return {
             "success": False,
             "error": "Repository path doesn't exist."
@@ -1830,6 +1989,7 @@ def plan_feature(req: PlanRequest):
     chunks_file = chunks_path_for(repo_path)
 
     if not chunks_file.exists():
+
         return {
             "success": False,
             "error": "chunks.json not found. Run /chunk first."
@@ -1838,57 +1998,96 @@ def plan_feature(req: PlanRequest):
     feature_request = req.feature_request.strip()
 
     if not feature_request:
+
         return {
             "success": False,
             "error": "feature_request cannot be empty."
         }
 
     try:
-        with open(chunks_file, "r", encoding="utf-8") as f:
+
+        with open(
+            chunks_file,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
             data = json.load(f)
+
     except json.JSONDecodeError:
+
         return {
             "success": False,
             "error": "chunks.json contains invalid JSON."
         }
 
-    chunks = data.get("chunks", [])
+    chunks = data.get(
+        "chunks",
+        []
+    )
 
-    # ---- Step 1: retrieve relevant chunks ----
     query = feature_request.lower()
+
     query_words = query.split()
 
     results = []
 
     for chunk in chunks:
+
         searchable_text = " ".join([
             str(chunk.get("name", "")),
             str(chunk.get("type", "")),
             str(chunk.get("file", "")),
             str(chunk.get("content", "")),
-            " ".join(chunk.get("imports", [])),
-            " ".join(chunk.get("references", []))
+            " ".join(
+                chunk.get("imports", [])
+            ),
+            " ".join(
+                chunk.get("references", [])
+            )
         ]).lower()
 
-        matched_words = [w for w in query_words if w in searchable_text]
+        matched_words = [
+            w
+            for w in query_words
+            if w in searchable_text
+        ]
 
         if not matched_words:
             continue
 
-        score = len(matched_words)
-        name = str(chunk.get("name", "")).lower()
+        score = len(
+            matched_words
+        )
+
+        name = str(
+            chunk.get("name", "")
+        ).lower()
+
         if query in name:
             score += 5
-        content = str(chunk.get("content", "")).lower()
+
+        content = str(
+            chunk.get("content", "")
+        ).lower()
+
         if query in content:
             score += 3
 
-        results.append({"score": score, "chunk": chunk})
+        results.append({
+            "score": score,
+            "chunk": chunk
+        })
 
-    results.sort(key=lambda r: r["score"], reverse=True)
+    results.sort(
+        key=lambda r: r["score"],
+        reverse=True
+    )
+
     results = results[:req.top_k]
 
     if not results:
+
         return {
             "success": True,
             "feature_request": feature_request,
@@ -1904,27 +2103,36 @@ def plan_feature(req: PlanRequest):
             "sources": [],
         }
 
-    # ---- Step 2: pull relationships for each retrieved chunk ----
     related_notes = []
+
     related_symbol_names = set()
 
     for result in results:
+
         chunk = result["chunk"]
+
         name = chunk.get("name")
 
         if not name or name in related_symbol_names:
             continue
+
         related_symbol_names.add(name)
 
         used_by = [
             c.get("name")
             for c in chunks
-            if c.get("name") != name and name in c.get("references", [])
+            if c.get("name") != name
+            and name in c.get(
+                "references",
+                []
+            )
         ]
 
         if used_by:
+
             related_notes.append(
-                f"{name} (in {chunk.get('file')}) is used by: "
+                f"{name} (in {chunk.get('file')}) "
+                f"is used by: "
                 f"{', '.join(sorted(set(used_by))[:5])} "
                 f"— changing it could affect these too."
             )
@@ -1932,11 +2140,13 @@ def plan_feature(req: PlanRequest):
     related_context = (
         "\n".join(related_notes)
         if related_notes
-        else "No cross-references found among the retrieved code."
+        else
+        "No cross-references found among the retrieved code."
     )
 
-    # ---- Step 3: build context + prompt ----
-    context = build_context_from_chunks(results)
+    context = build_context_from_chunks(
+        results
+    )
 
     prompt = f"""You are an AI Codebase Engineer, planning a new feature
 before any code is written.
@@ -1970,61 +2180,61 @@ CROSS-REFERENCES (what else touches this code):
 """
 
     try:
-        response = call_gemini_with_retry(prompt)
+
+        response = call_gemini_with_retry(
+            prompt
+        )
+
         plan = response.text
+
     except Exception as e:
+
         return {
             "success": False,
             "error": f"LLM call failed: {e}"
         }
 
-    sources = sorted({result["chunk"]["file"] for result in results})
+    sources = sorted({
+        result["chunk"]["file"]
+        for result in results
+    })
 
     return {
         "success": True,
         "feature_request": feature_request,
         "plan": plan,
         "retrieved_chunks": len(results),
-        "related_symbols": sorted(related_symbol_names),
+        "related_symbols": sorted(
+            related_symbol_names
+        ),
         "sources": sources,
         "model": GEMINI_MODEL,
     }
 
 
 # ============================================================
-# PROPOSE CHANGE (Day 11) — the AI proposes an actual code change,
-# but NEVER writes it back into the real file. It returns a diff
-# for a human to review, and saves the proposed version separately.
-#
-# Design choice: we ask the model for the COMPLETE new file content,
-# not a hand-written diff — models are far more reliable at writing
-# whole files than at writing correctly-formatted unified diff syntax.
-# We compute the diff ourselves afterward, so its format is always
-# guaranteed correct regardless of what the model returns.
+# PROPOSE CHANGE
 # ============================================================
-
-class ProposeChangeRequest(BaseModel):
-    repo_path: str
-    file_path: str
-    instruction: str
-
 
 def strip_code_fence(text: str) -> str:
     """
-    Models sometimes wrap raw file content in markdown code fences even
-    when explicitly told not to. Strip one leading/trailing fence if
-    present. If there's no fence, return the text completely unmodified —
-    blanket .strip()-ing here would silently eat a trailing newline and
-    create a fake one-line diff against files that end with one (nearly
-    all of them), even when nothing meaningful actually changed.
+    Models sometimes wrap raw file content in markdown code fences.
     """
+
     check = text.strip()
+
     if check.startswith("```"):
+
         lines = check.split("\n")
+
         lines = lines[1:]
+
         if lines and lines[-1].strip() == "```":
+
             lines = lines[:-1]
+
         return "\n".join(lines) + "\n"
+
     return text
 
 
@@ -2034,6 +2244,7 @@ def propose_change(req: ProposeChangeRequest):
     repo_path = Path(req.repo_path)
 
     if not repo_path.exists():
+
         return {
             "success": False,
             "error": "Repository path doesn't exist."
@@ -2042,43 +2253,64 @@ def propose_change(req: ProposeChangeRequest):
     instruction = req.instruction.strip()
 
     if not instruction:
+
         return {
             "success": False,
             "error": "instruction cannot be empty."
         }
 
-    # ---- SAFETY CHECK: make sure the target file actually stays
-    # inside the repo folder. Without this, a file_path like
-    # "../../../../some/system/file" could escape the repo entirely.
     repo_path_resolved = repo_path.resolve()
-    target_file = (repo_path / req.file_path).resolve()
+
+    target_file = (
+        repo_path / req.file_path
+    ).resolve()
 
     try:
-        target_file.relative_to(repo_path_resolved)
+
+        target_file.relative_to(
+            repo_path_resolved
+        )
+
     except ValueError:
+
         return {
             "success": False,
-            "error": "file_path escapes the repository folder — refusing."
+            "error": (
+                "file_path escapes the repository folder "
+                "— refusing."
+            )
         }
 
     if not target_file.exists():
+
         return {
             "success": False,
-            "error": f"File not found: {req.file_path}"
+            "error": (
+                f"File not found: "
+                f"{req.file_path}"
+            )
         }
 
     if not target_file.is_file():
+
         return {
             "success": False,
             "error": "file_path is not a file."
         }
 
     try:
-        original_content = target_file.read_text(encoding="utf-8")
+
+        original_content = target_file.read_text(
+            encoding="utf-8"
+        )
+
     except UnicodeDecodeError:
+
         return {
             "success": False,
-            "error": "This file is not a readable text file."
+            "error": (
+                "This file is not a readable text file."
+            )
         }
 
     prompt = f"""You are an AI Codebase Engineer making a single, focused code change.
@@ -2104,38 +2336,72 @@ CURRENT FILE CONTENT:
 """
 
     try:
-        response = call_gemini_with_retry(prompt)
-        proposed_content = strip_code_fence(response.text)
+
+        response = call_gemini_with_retry(
+            prompt
+        )
+
+        proposed_content = strip_code_fence(
+            response.text
+        )
+
     except Exception as e:
+
         return {
             "success": False,
             "error": f"LLM call failed: {e}"
         }
 
-    # ---- Compute the diff ourselves — never trust the model's own
-    # formatting for this part.
-    diff_lines = list(difflib.unified_diff(
-        original_content.splitlines(keepends=True),
-        proposed_content.splitlines(keepends=True),
-        fromfile=f"{req.file_path} (current)",
-        tofile=f"{req.file_path} (proposed)",
-    ))
-    diff_text = "".join(diff_lines)
+    diff_lines = list(
+        difflib.unified_diff(
+            original_content.splitlines(
+                keepends=True
+            ),
+            proposed_content.splitlines(
+                keepends=True
+            ),
+            fromfile=(
+                f"{req.file_path} (current)"
+            ),
+            tofile=(
+                f"{req.file_path} (proposed)"
+            ),
+        )
+    )
+
+    diff_text = "".join(
+        diff_lines
+    )
 
     if not diff_text.strip():
+
         return {
             "success": True,
             "file_path": req.file_path,
             "instruction": instruction,
             "changed": False,
-            "message": "The model did not propose any change to this file.",
+            "message": (
+                "The model did not propose "
+                "any change to this file."
+            ),
             "diff": "",
         }
 
-    # ---- Save the proposal SEPARATELY. The real file is never touched.
-    safe_name = req.file_path.replace("/", "__").replace("\\", "__")
-    proposal_file = PROPOSED_CHANGES_DIR / f"{repo_path.name}__{safe_name}.proposed"
-    proposal_file.write_text(proposed_content, encoding="utf-8")
+    safe_name = (
+        req.file_path
+        .replace("/", "__")
+        .replace("\\", "__")
+    )
+
+    proposal_file = (
+        PROPOSED_CHANGES_DIR
+        / f"{repo_path.name}__{safe_name}.proposed"
+    )
+
+    proposal_file.write_text(
+        proposed_content,
+        encoding="utf-8"
+    )
 
     return {
         "success": True,
@@ -2143,6 +2409,1378 @@ CURRENT FILE CONTENT:
         "instruction": instruction,
         "changed": True,
         "diff": diff_text,
-        "proposed_file_saved_to": str(proposal_file),
+        "proposed_file_saved_to": str(
+            proposal_file
+        ),
         "model": GEMINI_MODEL,
+    }
+
+
+# ============================================================
+# ============================================================
+# DAY 12 — TEST & VALIDATION ENGINE
+# ============================================================
+# ============================================================
+
+
+# ============================================================
+# LIMIT TEST OUTPUT
+# ============================================================
+
+def limit_output(
+    text: str,
+    max_size: int = MAX_OUTPUT_SIZE
+):
+    """
+    Prevent enormous test logs from consuming memory
+    or creating huge API responses.
+    """
+
+    if not text:
+        return ""
+
+    if len(text) <= max_size:
+        return text
+
+    return (
+        text[:max_size]
+        + "\n\n"
+        + "[OUTPUT TRUNCATED]"
+    )
+
+
+# ============================================================
+# DETECT TEST COMMAND
+# ============================================================
+
+def detect_test_command(repo_path: Path):
+    """
+    Detect a safe, known test command from repository files.
+
+    Supported currently:
+
+    Python / pytest
+    Node / npm test
+    Go
+    Maven
+    Gradle
+    """
+
+    # --------------------------------------------------------
+    # Python / pytest via pyproject.toml
+    # --------------------------------------------------------
+
+    pyproject = repo_path / "pyproject.toml"
+
+    if pyproject.exists():
+
+        try:
+
+            content = pyproject.read_text(
+                encoding="utf-8",
+                errors="ignore"
+            ).lower()
+
+            if "pytest" in content:
+
+                return {
+                    "detected": True,
+                    "framework": "pytest",
+                    "command": [
+                        "python",
+                        "-m",
+                        "pytest",
+                        "-q"
+                    ]
+                }
+
+        except Exception:
+            pass
+
+    # --------------------------------------------------------
+    # Python / pytest.ini
+    # --------------------------------------------------------
+
+    pytest_ini = repo_path / "pytest.ini"
+
+    if pytest_ini.exists():
+
+        return {
+            "detected": True,
+            "framework": "pytest",
+            "command": [
+                "python",
+                "-m",
+                "pytest",
+                "-q"
+            ]
+        }
+
+    # --------------------------------------------------------
+    # Python / setup.cfg
+    # --------------------------------------------------------
+
+    setup_cfg = repo_path / "setup.cfg"
+
+    if setup_cfg.exists():
+
+        try:
+
+            content = setup_cfg.read_text(
+                encoding="utf-8",
+                errors="ignore"
+            ).lower()
+
+            if "pytest" in content:
+
+                return {
+                    "detected": True,
+                    "framework": "pytest",
+                    "command": [
+                        "python",
+                        "-m",
+                        "pytest",
+                        "-q"
+                    ]
+                }
+
+        except Exception:
+            pass
+
+    # --------------------------------------------------------
+    # Node / package.json
+    # --------------------------------------------------------
+
+    package_json = repo_path / "package.json"
+
+    if package_json.exists():
+
+        try:
+
+            with open(
+                package_json,
+                "r",
+                encoding="utf-8"
+            ) as f:
+
+                package_data = json.load(f)
+
+            scripts = package_data.get(
+                "scripts",
+                {}
+            )
+
+            if "test" in scripts:
+
+                return {
+                    "detected": True,
+                    "framework": "npm",
+                    "command": [
+                        "npm",
+                        "test"
+                    ]
+                }
+
+        except Exception:
+            pass
+
+    # --------------------------------------------------------
+    # Go
+    # --------------------------------------------------------
+
+    if any(
+        repo_path.glob("*_test.go")
+    ):
+
+        return {
+            "detected": True,
+            "framework": "go",
+            "command": [
+                "go",
+                "test",
+                "./..."
+            ]
+        }
+
+    # --------------------------------------------------------
+    # Maven
+    # --------------------------------------------------------
+
+    if (repo_path / "pom.xml").exists():
+
+        return {
+            "detected": True,
+            "framework": "maven",
+            "command": [
+                "mvn",
+                "test"
+            ]
+        }
+
+    # --------------------------------------------------------
+    # Gradle wrapper
+    # --------------------------------------------------------
+
+    if (repo_path / "gradlew").exists():
+
+        return {
+            "detected": True,
+            "framework": "gradle",
+            "command": [
+                "./gradlew",
+                "test"
+            ]
+        }
+
+    # --------------------------------------------------------
+    # Gradle installed globally
+    # --------------------------------------------------------
+
+    if (repo_path / "build.gradle").exists():
+
+        return {
+            "detected": True,
+            "framework": "gradle",
+            "command": [
+                "gradle",
+                "test"
+            ]
+        }
+
+    # --------------------------------------------------------
+    # Nothing detected
+    # --------------------------------------------------------
+
+    return {
+        "detected": False,
+        "framework": None,
+        "command": None
+    }
+
+
+# ============================================================
+# RUN TEST COMMAND
+# ============================================================
+
+def run_test_command(
+    repo_path: Path,
+    command: list[str],
+    timeout_seconds: int
+):
+    """
+    Execute a known test command inside the repository.
+
+    Security properties:
+
+    - shell=False
+    - working directory restricted to repository
+    - timeout enforced
+    - stdout/stderr captured
+    """
+
+    if timeout_seconds <= 0:
+
+        raise ValueError(
+            "timeout_seconds must be greater than 0."
+        )
+
+    if timeout_seconds > MAX_TEST_TIMEOUT:
+
+        timeout_seconds = MAX_TEST_TIMEOUT
+
+    start_time = time.perf_counter()
+
+    try:
+
+        result = subprocess.run(
+            command,
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            shell=False
+        )
+
+        duration = (
+            time.perf_counter()
+            - start_time
+        )
+
+        return {
+            "executed": True,
+
+            "passed":
+                result.returncode == 0,
+
+            "timed_out":
+                False,
+
+            "exit_code":
+                result.returncode,
+
+            "command":
+                command,
+
+            "stdout":
+                limit_output(
+                    result.stdout
+                ),
+
+            "stderr":
+                limit_output(
+                    result.stderr
+                ),
+
+            "duration_seconds":
+                round(
+                    duration,
+                    2
+                )
+        }
+
+    except subprocess.TimeoutExpired as e:
+
+        duration = (
+            time.perf_counter()
+            - start_time
+        )
+
+        stdout = e.stdout or ""
+
+        stderr = e.stderr or ""
+
+        if isinstance(
+            stdout,
+            bytes
+        ):
+
+            stdout = stdout.decode(
+                "utf-8",
+                errors="replace"
+            )
+
+        if isinstance(
+            stderr,
+            bytes
+        ):
+
+            stderr = stderr.decode(
+                "utf-8",
+                errors="replace"
+            )
+
+        return {
+            "executed": True,
+
+            "passed": False,
+
+            "timed_out": True,
+
+            "exit_code": None,
+
+            "command": command,
+
+            "stdout":
+                limit_output(
+                    stdout
+                ),
+
+            "stderr":
+                limit_output(
+                    stderr
+                ),
+
+            "duration_seconds":
+                round(
+                    duration,
+                    2
+                ),
+
+            "error": (
+                f"Tests exceeded the "
+                f"{timeout_seconds} second timeout."
+            )
+        }
+
+    except FileNotFoundError:
+
+        duration = (
+            time.perf_counter()
+            - start_time
+        )
+
+        return {
+            "executed": False,
+
+            "passed": False,
+
+            "timed_out": False,
+
+            "exit_code": None,
+
+            "command": command,
+
+            "stdout": "",
+
+            "stderr": "",
+
+            "duration_seconds":
+                round(
+                    duration,
+                    2
+                ),
+
+            "error": (
+                f"Test command not found: "
+                f"{command[0]}"
+            )
+        }
+
+    except Exception as e:
+
+        duration = (
+            time.perf_counter()
+            - start_time
+        )
+
+        return {
+            "executed": False,
+
+            "passed": False,
+
+            "timed_out": False,
+
+            "exit_code": None,
+
+            "command": command,
+
+            "stdout": "",
+
+            "stderr": "",
+
+            "duration_seconds":
+                round(
+                    duration,
+                    2
+                ),
+
+            "error": str(e)
+        }
+
+
+# ============================================================
+# DIAGNOSE TEST FAILURE
+# ============================================================
+
+def diagnose_test_failure(
+    repo_path: Path,
+    test_result: dict,
+    chunks: list,
+    top_k: int = 5
+):
+    """
+    Use Gemini to diagnose a failed test.
+
+    Gemini receives:
+
+    1. Test command
+    2. Exit code
+    3. stdout
+    4. stderr
+    5. Relevant repository chunks
+    """
+
+    failure_text = "\n".join([
+        "TEST COMMAND:",
+        " ".join(
+            test_result.get(
+                "command",
+                []
+            )
+        ),
+
+        "",
+
+        f"EXIT CODE: "
+        f"{test_result.get('exit_code')}",
+
+        "",
+
+        "STDOUT:",
+
+        test_result.get(
+            "stdout",
+            ""
+        ),
+
+        "",
+
+        "STDERR:",
+
+        test_result.get(
+            "stderr",
+            ""
+        )
+    ])
+
+    # --------------------------------------------------------
+    # Search repository chunks using test failure output
+    # --------------------------------------------------------
+
+    combined_failure = (
+        test_result.get(
+            "stdout",
+            ""
+        )
+        + "\n"
+        + test_result.get(
+            "stderr",
+            ""
+        )
+    )
+
+    failure_lower = combined_failure.lower()
+
+    query_words = failure_lower.split()
+
+    results = []
+
+    for chunk in chunks:
+
+        searchable_text = " ".join([
+            str(chunk.get("name", "")),
+            str(chunk.get("type", "")),
+            str(chunk.get("file", "")),
+            str(chunk.get("content", "")),
+            " ".join(
+                chunk.get(
+                    "imports",
+                    []
+                )
+            ),
+            " ".join(
+                chunk.get(
+                    "references",
+                    []
+                )
+            )
+        ]).lower()
+
+        matched_words = [
+            word
+            for word in query_words
+            if len(word) >= 3
+            and word in searchable_text
+        ]
+
+        if not matched_words:
+            continue
+
+        score = len(
+            set(
+                matched_words
+            )
+        )
+
+        name = str(
+            chunk.get(
+                "name",
+                ""
+            )
+        ).lower()
+
+        file_path = str(
+            chunk.get(
+                "file",
+                ""
+            )
+        ).lower()
+
+        # ----------------------------------------------------
+        # Strong signals from filenames/symbol names
+        # ----------------------------------------------------
+
+        if file_path in failure_lower:
+
+            score += 10
+
+        if name and name in failure_lower:
+
+            score += 10
+
+        results.append({
+            "score": score,
+            "chunk": chunk
+        })
+
+    results.sort(
+        key=lambda result:
+            result["score"],
+        reverse=True
+    )
+
+    results = results[:top_k]
+
+    context = build_context_from_chunks(
+        results
+    )
+
+    prompt = f"""You are an AI Codebase Engineer
+diagnosing a failed automated test.
+
+Use ONLY the provided test output and repository
+code context.
+
+Do not invent files, functions, behavior, or errors
+that are not supported by the evidence.
+
+Your job is to determine the most likely cause of
+the failure and explain what should be investigated.
+
+Respond using exactly this structure:
+
+FAILURE SUMMARY:
+<brief description of what failed>
+
+LIKELY CAUSE:
+<best-supported explanation>
+
+EVIDENCE:
+<specific evidence from the test output and code,
+with citations such as (file.py, lines 10-20)>
+
+FILES / FUNCTIONS TO CHECK:
+<short list and why>
+
+RECOMMENDED NEXT STEP:
+<what an engineer should investigate or change next>
+
+CONFIDENCE:
+<High / Medium / Low and why>
+
+TEST OUTPUT:
+{failure_text}
+
+RELEVANT CODE:
+{context}
+"""
+
+    response = call_gemini_with_retry(
+        prompt
+    )
+
+    return {
+        "diagnosis":
+            response.text,
+
+        "retrieved_chunks":
+            len(results),
+
+        "sources":
+            sorted({
+                result["chunk"]["file"]
+                for result in results
+            })
+    }
+
+
+# ============================================================
+# DETECT TESTS ENDPOINT
+# ============================================================
+class DetectTestsRequest(BaseModel):
+    repo_path: str
+
+
+@app.post("/detect-tests")
+def detect_tests(req: DetectTestsRequest):
+
+    repo_path = Path(req.repo_path)
+
+    if not repo_path.exists():
+        return {
+            "success": False,
+            "error": "Repository path doesn't exist."
+        }
+
+    if not repo_path.is_dir():
+        return {
+            "success": False,
+            "error": "Repository path is not a directory."
+        }
+
+    # ---------------------------------------------------------
+    # 1. Python / pytest
+    # ---------------------------------------------------------
+
+    pytest_indicators = [
+        "pytest.ini",
+        "pyproject.toml",
+        "tox.ini",
+        "setup.cfg",
+    ]
+
+    has_pytest_config = any(
+        (repo_path / name).exists()
+        for name in pytest_indicators
+    )
+
+    pytest_files = []
+
+    for pattern in [
+        "test_*.py",
+        "*_test.py",
+    ]:
+        pytest_files.extend(
+            repo_path.rglob(pattern)
+        )
+
+    if has_pytest_config or pytest_files:
+        return {
+            "success": True,
+            "repository": str(repo_path),
+            "detected": True,
+            "framework": "pytest",
+            "command": "pytest",
+            "test_files": [
+                str(p.relative_to(repo_path))
+                for p in pytest_files
+            ],
+        }
+
+    # ---------------------------------------------------------
+    # 2. Node / npm
+    # ---------------------------------------------------------
+
+    package_json = repo_path / "package.json"
+
+    if package_json.exists():
+
+        try:
+            with open(
+                package_json,
+                "r",
+                encoding="utf-8"
+            ) as f:
+                package_data = json.load(f)
+
+            scripts = package_data.get(
+                "scripts",
+                {}
+            )
+
+            if "test" in scripts:
+                return {
+                    "success": True,
+                    "repository": str(repo_path),
+                    "detected": True,
+                    "framework": "npm",
+                    "command": "npm test",
+                }
+
+        except Exception:
+            pass
+
+    # ---------------------------------------------------------
+    # 3. Jupyter notebooks
+    # ---------------------------------------------------------
+
+    notebooks = list(
+        repo_path.rglob("*.ipynb")
+    )
+
+    # Ignore Jupyter checkpoint files
+    notebooks = [
+        notebook
+        for notebook in notebooks
+        if ".ipynb_checkpoints" not in notebook.parts
+    ]
+
+    if notebooks:
+
+        return {
+            "success": True,
+            "repository": str(repo_path),
+            "detected": True,
+            "framework": "jupyter",
+            "command": (
+                "jupyter nbconvert "
+                "--execute "
+                "--to notebook"
+            ),
+            "test_files": [
+                str(
+                    notebook.relative_to(repo_path)
+                )
+                for notebook in notebooks
+            ],
+        }
+
+    # ---------------------------------------------------------
+    # 4. Nothing detected
+    # ---------------------------------------------------------
+
+    return {
+        "success": True,
+        "repository": str(repo_path),
+        "detected": False,
+        "framework": None,
+        "command": None,
+    }
+
+# ============================================================
+# VALIDATE ENDPOINT
+# ============================================================
+
+class ValidateRequest(BaseModel):
+    repo_path: str
+
+
+def validate_jupyter_notebook(
+    repo_path: Path,
+    notebook_path: Path
+):
+    """
+    Execute a Jupyter notebook against the repository.
+
+    The original notebook is NEVER modified.
+
+    A temporary executed copy is created and removed afterward.
+    """
+
+    try:
+
+        from nbconvert.preprocessors import ExecutePreprocessor
+        import nbformat
+
+    except ImportError as e:
+
+        return {
+            "passed": False,
+            "error": (
+                "Jupyter validation dependencies are missing. "
+                "Install with: pip install nbconvert nbclient jupyter"
+            ),
+            "details": str(e),
+        }
+
+    try:
+
+        with open(
+            notebook_path,
+            "r",
+            encoding="utf-8"
+        ) as f:
+            notebook = nbformat.read(
+                f,
+                as_version=4
+            )
+
+    except Exception as e:
+
+        return {
+            "passed": False,
+            "error": "Could not read notebook.",
+            "details": str(e),
+        }
+
+    # ---------------------------------------------------------
+    # Execute in the repository root.
+    #
+    # This is important because notebooks often use paths like:
+    #
+    # data/file.csv
+    #
+    # ---------------------------------------------------------
+
+    executor = ExecutePreprocessor(
+        timeout=600,
+        kernel_name="python3",
+    )
+
+    # Prevent matplotlib windows from appearing during validation.
+    env = os.environ.copy()
+    env["MPLBACKEND"] = "Agg"
+
+    old_env = os.environ.copy()
+
+    try:
+
+        os.environ.update(env)
+
+        executor.preprocess(
+            notebook,
+            {
+                "metadata": {
+                    "path": str(repo_path)
+                }
+            }
+        )
+
+        return {
+            "passed": True,
+            "message": (
+                "Notebook executed successfully."
+            ),
+        }
+
+    except Exception as e:
+
+        traceback_text = str(e)
+
+        # nbconvert exceptions can contain a useful traceback
+        # inside the exception text.
+        return {
+            "passed": False,
+            "message": "Notebook execution failed.",
+            "error": type(e).__name__,
+            "traceback": traceback_text,
+        }
+
+    finally:
+
+        os.environ.clear()
+        os.environ.update(old_env)
+
+
+@app.post("/validate")
+def validate_repository(req: ValidateRequest):
+
+    repo_path = Path(req.repo_path)
+
+    if not repo_path.exists():
+
+        return {
+            "success": False,
+            "error": "Repository path doesn't exist."
+        }
+
+    if not repo_path.is_dir():
+
+        return {
+            "success": False,
+            "error": "Repository path is not a directory."
+        }
+
+    # ---------------------------------------------------------
+    # Detect the testing / validation framework
+    # ---------------------------------------------------------
+
+    detection = detect_tests(
+        DetectTestsRequest(
+            repo_path=str(repo_path)
+        )
+    )
+
+    if not detection.get("detected"):
+
+        return {
+            "success": True,
+            "validated": False,
+            "passed": False,
+            "message": (
+                "No supported test framework was detected."
+            ),
+            "repository": str(repo_path),
+        }
+
+    framework = detection.get(
+        "framework"
+    )
+
+    # ---------------------------------------------------------
+    # JUPYTER
+    # ---------------------------------------------------------
+
+    if framework == "jupyter":
+
+        test_files = detection.get(
+            "test_files",
+            []
+        )
+
+        results = []
+
+        for relative_file in test_files:
+
+            notebook_path = (
+                repo_path / relative_file
+            )
+
+            result = validate_jupyter_notebook(
+                repo_path,
+                notebook_path
+            )
+
+            results.append({
+                "file": relative_file,
+                **result
+            })
+
+        all_passed = all(
+            result.get("passed", False)
+            for result in results
+        )
+
+        return {
+            "success": True,
+            "validated": True,
+            "passed": all_passed,
+            "framework": "jupyter",
+            "repository": str(repo_path),
+            "results": results,
+        }
+
+    # ---------------------------------------------------------
+    # PYTEST
+    # ---------------------------------------------------------
+
+    if framework == "pytest":
+
+        try:
+
+            result = subprocess.run(
+                [
+                    "pytest",
+                    "-q"
+                ],
+                cwd=str(repo_path),
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+
+            return {
+                "success": True,
+                "validated": True,
+                "passed": (
+                    result.returncode == 0
+                ),
+                "framework": "pytest",
+                "command": "pytest -q",
+                "return_code": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "repository": str(repo_path),
+            }
+
+        except subprocess.TimeoutExpired:
+
+            return {
+                "success": True,
+                "validated": True,
+                "passed": False,
+                "framework": "pytest",
+                "message": (
+                    "Tests exceeded the 10 minute timeout."
+                ),
+                "repository": str(repo_path),
+            }
+
+        except Exception as e:
+
+            return {
+                "success": False,
+                "error": str(e),
+            }
+
+    # ---------------------------------------------------------
+    # NPM
+    # ---------------------------------------------------------
+
+    if framework == "npm":
+
+        try:
+
+            result = subprocess.run(
+                [
+                    "npm",
+                    "test"
+                ],
+                cwd=str(repo_path),
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+
+            return {
+                "success": True,
+                "validated": True,
+                "passed": (
+                    result.returncode == 0
+                ),
+                "framework": "npm",
+                "command": "npm test",
+                "return_code": result.returncode,
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "repository": str(repo_path),
+            }
+
+        except subprocess.TimeoutExpired:
+
+            return {
+                "success": True,
+                "validated": True,
+                "passed": False,
+                "framework": "npm",
+                "message": (
+                    "Tests exceeded the 10 minute timeout."
+                ),
+                "repository": str(repo_path),
+            }
+
+        except Exception as e:
+
+            return {
+                "success": False,
+                "error": str(e),
+            }
+
+    return {
+        "success": False,
+        "error": (
+            f"Unsupported test framework: {framework}"
+        ),
+    }
+
+    # --------------------------------------------------------
+    # Detect test framework
+    # --------------------------------------------------------
+
+    detected = detect_test_command(
+        repo_path
+    )
+
+    if not detected["detected"]:
+
+        return {
+            "success": True,
+            "validated": False,
+            "passed": False,
+            "message": (
+                "No supported test framework "
+                "was detected."
+            ),
+            "repository":
+                str(repo_path)
+        }
+
+    # --------------------------------------------------------
+    # Get command
+    # --------------------------------------------------------
+
+    command = detected["command"]
+
+    # --------------------------------------------------------
+    # Run tests
+    # --------------------------------------------------------
+
+    test_result = run_test_command(
+        repo_path=repo_path,
+        command=command,
+        timeout_seconds=req.timeout_seconds
+    )
+
+    # --------------------------------------------------------
+    # Test execution itself failed
+    #
+    # Example:
+    # pytest command not installed.
+    # --------------------------------------------------------
+
+    if not test_result["executed"]:
+
+        return {
+            "success": True,
+
+            "validated": False,
+
+            "passed": False,
+
+            "framework":
+                detected["framework"],
+
+            "test_result":
+                test_result,
+
+            "ai_diagnosis":
+                None
+        }
+
+    # --------------------------------------------------------
+    # Tests passed
+    #
+    # IMPORTANT:
+    # Do not spend a Gemini request on successful tests.
+    # --------------------------------------------------------
+
+    if test_result["passed"]:
+
+        return {
+            "success": True,
+
+            "validated": True,
+
+            "passed": True,
+
+            "framework":
+                detected["framework"],
+
+            "test_result":
+                test_result,
+
+            "ai_diagnosis":
+                None,
+
+            "message":
+                "All detected tests passed."
+        }
+
+    # --------------------------------------------------------
+    # Tests failed
+    #
+    # Now we need repository chunks for Gemini diagnosis.
+    # --------------------------------------------------------
+
+    chunks_file = chunks_path_for(
+        repo_path
+    )
+
+    if not chunks_file.exists():
+
+        return {
+            "success": True,
+
+            "validated": True,
+
+            "passed": False,
+
+            "framework":
+                detected["framework"],
+
+            "test_result":
+                test_result,
+
+            "ai_diagnosis":
+                None,
+
+            "diagnosis_error": (
+                "Tests failed, but chunks.json "
+                "was not found. Run /chunk first."
+            )
+        }
+
+    # --------------------------------------------------------
+    # Load chunks
+    # --------------------------------------------------------
+
+    try:
+
+        with open(
+            chunks_file,
+            "r",
+            encoding="utf-8"
+        ) as f:
+
+            data = json.load(f)
+
+        chunks = data.get(
+            "chunks",
+            []
+        )
+
+    except json.JSONDecodeError:
+
+        return {
+            "success": True,
+
+            "validated": True,
+
+            "passed": False,
+
+            "framework":
+                detected["framework"],
+
+            "test_result":
+                test_result,
+
+            "ai_diagnosis":
+                None,
+
+            "diagnosis_error": (
+                "Tests failed, but chunks.json "
+                "contains invalid JSON."
+            )
+        }
+
+    # --------------------------------------------------------
+    # Ask Gemini to diagnose failure
+    # --------------------------------------------------------
+
+    try:
+
+        diagnosis = diagnose_test_failure(
+            repo_path=repo_path,
+
+            test_result=test_result,
+
+            chunks=chunks,
+
+            top_k=req.top_k
+        )
+
+    except Exception as e:
+
+        return {
+            "success": True,
+
+            "validated": True,
+
+            "passed": False,
+
+            "framework":
+                detected["framework"],
+
+            "test_result":
+                test_result,
+
+            "ai_diagnosis":
+                None,
+
+            "diagnosis_error":
+                f"AI diagnosis failed: {e}"
+        }
+
+    # --------------------------------------------------------
+    # Final validation response
+    # --------------------------------------------------------
+
+    return {
+        "success": True,
+
+        "validated": True,
+
+        "passed": False,
+
+        "framework":
+            detected["framework"],
+
+        "test_result":
+            test_result,
+
+        "ai_diagnosis":
+            diagnosis["diagnosis"],
+
+        "diagnosis_retrieved_chunks":
+            diagnosis[
+                "retrieved_chunks"
+            ],
+
+        "diagnosis_sources":
+            diagnosis[
+                "sources"
+            ],
+
+        "model":
+            GEMINI_MODEL
     }
