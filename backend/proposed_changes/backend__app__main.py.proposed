@@ -177,6 +177,11 @@ def remove_readonly(func, path, exc_info):
 
 @app.post("/ingest")
 def ingest_repo(req: IngestRequest):
+    """
+    Clones a Git repository into the workspace directory (deleting any existing clone
+    first), counts files while filtering out ignored directories, and returns basic
+    repository metadata.
+    """
 
     repo_name = req.repo_url.rstrip("/").split("/")[-1]
 
