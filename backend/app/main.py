@@ -1,10 +1,23 @@
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from . import services
+from .services import (
+    ingest_repo,
+    analyze_repo,
+    chunk_repo,
+    retrieve_chunks,
+    build_context,
+    ask_codebase,
+    get_relationships,
+    investigate_bug,
+    plan_feature,
+    propose_change,
+    engineer_workflow,
+)
 
 
 # ============================================================
@@ -46,6 +59,12 @@ class RetrieveRequest(BaseModel):
     top_k: int = 5
 
 
+class ContextRequest(BaseModel):
+    repo_path: str
+    query: str
+    top_k: int = 5
+
+
 class PromptRequest(BaseModel):
     repo_path: str
     question: str
@@ -81,12 +100,23 @@ class ProposeChangeRequest(BaseModel):
     instruction: str
 
 
-class DetectTestsRequest(BaseModel):
-    repo_path: str
+# ============================================================
+# DAY 13 — ENGINEER REQUEST
+# ============================================================
 
+class EngineerRequest(BaseModel):
 
-class ValidateRequest(BaseModel):
-    repo_path: str
+    repo_url: str
+
+    task_type: Literal[
+        "ask",
+        "investigate",
+        "plan"
+    ] = "ask"
+
+    question: str
+
+    top_k: int = 5
 
 
 # ============================================================
@@ -97,7 +127,8 @@ class ValidateRequest(BaseModel):
 def root():
 
     return {
-        "message": "AI Codebase Engineer API is running."
+        "message":
+            "AI Codebase Engineer API is running."
     }
 
 
@@ -114,10 +145,10 @@ def health_check():
 # ============================================================
 
 @app.post("/ingest")
-def ingest_repo(req: IngestRequest):
+def ingest(request: IngestRequest):
 
-    return services.ingest_repo(
-        req.repo_url
+    return ingest_repo(
+        request.repo_url
     )
 
 
@@ -126,10 +157,10 @@ def ingest_repo(req: IngestRequest):
 # ============================================================
 
 @app.post("/analyze")
-def analyze_repo(req: AnalyzeRequest):
+def analyze(request: AnalyzeRequest):
 
-    return services.analyze_repo(
-        Path(req.cloned_to)
+    return analyze_repo(
+        Path(request.cloned_to)
     )
 
 
@@ -138,10 +169,10 @@ def analyze_repo(req: AnalyzeRequest):
 # ============================================================
 
 @app.post("/chunk")
-def chunk_repo(req: ChunkRequest):
+def chunk(request: ChunkRequest):
 
-    return services.chunk_repo(
-        Path(req.repo_path)
+    return chunk_repo(
+        Path(request.repo_path)
     )
 
 
@@ -150,13 +181,41 @@ def chunk_repo(req: ChunkRequest):
 # ============================================================
 
 @app.post("/retrieve")
-def retrieve_chunks(req: RetrieveRequest):
+def retrieve(request: RetrieveRequest):
 
-    return services.retrieve_chunks(
-        Path(req.repo_path),
-        req.query,
-        req.top_k
+    repo_path = Path(
+        request.repo_path
     )
+
+    if not repo_path.exists():
+
+        return {
+            "success": False,
+            "error":
+                "Repository path doesn't exist."
+        }
+
+    try:
+
+        return retrieve_chunks(
+            repo_path,
+            request.query,
+            request.top_k
+        )
+
+    except FileNotFoundError as e:
+
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+    except Exception as e:
+
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 
 # ============================================================
@@ -164,13 +223,41 @@ def retrieve_chunks(req: RetrieveRequest):
 # ============================================================
 
 @app.post("/context")
-def build_context(req: RetrieveRequest):
+def context(request: ContextRequest):
 
-    return services.build_context(
-        Path(req.repo_path),
-        req.query,
-        req.top_k
+    repo_path = Path(
+        request.repo_path
     )
+
+    if not repo_path.exists():
+
+        return {
+            "success": False,
+            "error":
+                "Repository path doesn't exist."
+        }
+
+    try:
+
+        return build_context(
+            repo_path,
+            request.query,
+            request.top_k
+        )
+
+    except FileNotFoundError as e:
+
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+    except Exception as e:
+
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 
 # ============================================================
@@ -178,13 +265,81 @@ def build_context(req: RetrieveRequest):
 # ============================================================
 
 @app.post("/prompt")
-def build_prompt(req: PromptRequest):
+def prompt(request: PromptRequest):
 
-    return services.build_prompt(
-        Path(req.repo_path),
-        req.question,
-        req.top_k
+    repo_path = Path(
+        request.repo_path
     )
+
+    if not repo_path.exists():
+
+        return {
+            "success": False,
+            "error":
+                "Repository path doesn't exist."
+        }
+
+    try:
+
+        chunks = retrieve_chunks(
+            repo_path,
+            request.question,
+            request.top_k
+        )
+
+        context_text = ""
+
+        for result in chunks.get(
+            "results",
+            []
+        ):
+
+            chunk = result["chunk"]
+
+            context_text += (
+                f"\nFILE: {chunk.get('file')}\n"
+                f"TYPE: {chunk.get('type')}\n"
+                f"NAME: {chunk.get('name')}\n"
+                f"LINES: "
+                f"{chunk.get('start_line')}-"
+                f"{chunk.get('end_line')}\n\n"
+                f"{chunk.get('content')}\n"
+            )
+
+        prompt_text = f"""You are an AI Codebase Engineer.
+
+Use the provided code context as your primary source.
+
+Do not invent files, functions, classes, or behavior.
+
+USER QUESTION:
+{request.question}
+
+CODEBASE CONTEXT:
+{context_text}
+"""
+
+        return {
+            "success": True,
+            "question":
+                request.question,
+            "retrieved_chunks":
+                len(
+                    chunks.get(
+                        "results",
+                        []
+                    )
+                ),
+            "prompt":
+                prompt_text
+        }
+
+    except Exception as e:
+
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 
 # ============================================================
@@ -192,13 +347,42 @@ def build_prompt(req: PromptRequest):
 # ============================================================
 
 @app.post("/ask")
-def ask_codebase(req: AskRequest):
+def ask(request: AskRequest):
 
-    return services.ask_codebase(
-        Path(req.repo_path),
-        req.question,
-        req.top_k
+    repo_path = Path(
+        request.repo_path
     )
+
+    if not repo_path.exists():
+
+        return {
+            "success": False,
+            "error":
+                "Repository path doesn't exist."
+        }
+
+    try:
+
+        return ask_codebase(
+            repo_path,
+            request.question,
+            request.top_k
+        )
+
+    except FileNotFoundError as e:
+
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+    except Exception as e:
+
+        return {
+            "success": False,
+            "error":
+                f"LLM call failed: {e}"
+        }
 
 
 # ============================================================
@@ -206,14 +390,35 @@ def ask_codebase(req: AskRequest):
 # ============================================================
 
 @app.post("/relationships")
-def get_relationships(
-    req: RelationshipsRequest
+def relationships(
+    request: RelationshipsRequest
 ):
 
-    return services.get_relationships(
-        Path(req.repo_path),
-        req.name
+    repo_path = Path(
+        request.repo_path
     )
+
+    if not repo_path.exists():
+
+        return {
+            "success": False,
+            "error":
+                "Repository path doesn't exist."
+        }
+
+    try:
+
+        return get_relationships(
+            repo_path,
+            request.name
+        )
+
+    except Exception as e:
+
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 
 # ============================================================
@@ -221,15 +426,37 @@ def get_relationships(
 # ============================================================
 
 @app.post("/investigate")
-def investigate_bug(
-    req: InvestigateRequest
+def investigate(
+    request: InvestigateRequest
 ):
 
-    return services.investigate_bug(
-        Path(req.repo_path),
-        req.bug_description,
-        req.top_k
+    repo_path = Path(
+        request.repo_path
     )
+
+    if not repo_path.exists():
+
+        return {
+            "success": False,
+            "error":
+                "Repository path doesn't exist."
+        }
+
+    try:
+
+        return investigate_bug(
+            repo_path,
+            request.bug_description,
+            request.top_k
+        )
+
+    except Exception as e:
+
+        return {
+            "success": False,
+            "error":
+                f"LLM call failed: {e}"
+        }
 
 
 # ============================================================
@@ -237,15 +464,37 @@ def investigate_bug(
 # ============================================================
 
 @app.post("/plan")
-def plan_feature(
-    req: PlanRequest
+def plan(
+    request: PlanRequest
 ):
 
-    return services.plan_feature(
-        Path(req.repo_path),
-        req.feature_request,
-        req.top_k
+    repo_path = Path(
+        request.repo_path
     )
+
+    if not repo_path.exists():
+
+        return {
+            "success": False,
+            "error":
+                "Repository path doesn't exist."
+        }
+
+    try:
+
+        return plan_feature(
+            repo_path,
+            request.feature_request,
+            request.top_k
+        )
+
+    except Exception as e:
+
+        return {
+            "success": False,
+            "error":
+                f"LLM call failed: {e}"
+        }
 
 
 # ============================================================
@@ -253,40 +502,98 @@ def plan_feature(
 # ============================================================
 
 @app.post("/propose-change")
-def propose_change(
-    req: ProposeChangeRequest
+def propose_change_route(
+    request: ProposeChangeRequest
 ):
 
-    return services.propose_change(
-        Path(req.repo_path),
-        req.file_path,
-        req.instruction
+    repo_path = Path(
+        request.repo_path
     )
 
+    if not repo_path.exists():
+
+        return {
+            "success": False,
+            "error":
+                "Repository path doesn't exist."
+        }
+
+    if not request.instruction.strip():
+
+        return {
+            "success": False,
+            "error":
+                "instruction cannot be empty."
+        }
+
+    try:
+
+        return propose_change(
+            repo_path,
+            request.file_path,
+            request.instruction
+        )
+
+    except Exception as e:
+
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
 
 # ============================================================
-# DAY 12 — TEST DETECTION
+# DAY 13 — END-TO-END ENGINEER
 # ============================================================
 
-@app.post("/detect-tests")
-def detect_tests(
-    req: DetectTestsRequest
+@app.post("/engineer")
+def engineer(
+    request: EngineerRequest
 ):
 
-    return services.detect_tests(
-        Path(req.repo_path)
-    )
+    if not request.repo_url.strip():
 
+        return {
+            "success": False,
+            "error":
+                "repo_url cannot be empty."
+        }
 
-# ============================================================
-# DAY 12 — VALIDATION
-# ============================================================
+    if not request.question.strip():
 
-@app.post("/validate")
-def validate_repository(
-    req: ValidateRequest
-):
+        return {
+            "success": False,
+            "error":
+                "question cannot be empty."
+        }
 
-    return services.validate_repository(
-        Path(req.repo_path)
-    )
+    if request.top_k < 1:
+
+        return {
+            "success": False,
+            "error":
+                "top_k must be at least 1."
+        }
+
+    try:
+
+        return engineer_workflow(
+            repo_url=
+                request.repo_url,
+            task_type=
+                request.task_type,
+            question=
+                request.question,
+            top_k=
+                request.top_k
+        )
+
+    except Exception as e:
+
+        return {
+            "success": False,
+            "stage":
+                "engineer",
+            "error":
+                str(e)
+        }

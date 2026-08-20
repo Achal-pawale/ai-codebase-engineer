@@ -1,7 +1,3 @@
-from pathlib import Path
-from dotenv import load_dotenv
-from google import genai
-
 import ast
 import difflib
 import json
@@ -10,10 +6,14 @@ import shutil
 import stat
 import subprocess
 import time
+from pathlib import Path
+
+from dotenv import load_dotenv
+from google import genai
 
 
 # ============================================================
-# PATHS / CONFIGURATION
+# PATHS / CONFIG
 # ============================================================
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
@@ -37,6 +37,7 @@ gemini_client = genai.Client(
     api_key=GEMINI_API_KEY
 )
 
+
 WORKSPACE_DIR = BACKEND_DIR / "workspace"
 WORKSPACE_DIR.mkdir(exist_ok=True)
 
@@ -47,10 +48,6 @@ PROPOSED_CHANGES_DIR = BACKEND_DIR / "proposed_changes"
 PROPOSED_CHANGES_DIR.mkdir(exist_ok=True)
 
 
-# ============================================================
-# CONSTANTS
-# ============================================================
-
 IGNORE_DIRS = {
     ".git",
     "node_modules",
@@ -58,6 +55,7 @@ IGNORE_DIRS = {
     "venv",
     ".venv",
 }
+
 
 CODE_EXTENSIONS = {
     ".py",
@@ -92,6 +90,7 @@ def call_gemini_with_retry(
     for attempt in range(max_retries):
 
         try:
+
             return gemini_client.models.generate_content(
                 model=GEMINI_MODEL,
                 contents=prompt,
@@ -115,36 +114,19 @@ def call_gemini_with_retry(
 
 
 # ============================================================
-# COMMON HELPERS
+# GENERAL HELPERS
 # ============================================================
+
+def remove_readonly(func, path, exc_info):
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
 
 def chunks_path_for(repo_path: Path) -> Path:
     return DATA_DIR / f"{repo_path.name}_chunks.json"
 
 
-def validate_repo_path(repo_path: Path):
-    """
-    Validate that a repository path exists and is a directory.
-
-    Returns:
-        None when valid.
-        Error string when invalid.
-    """
-
-    if not repo_path.exists():
-        return "Repository path doesn't exist."
-
-    if not repo_path.is_dir():
-        return "Repository path is not a directory."
-
-    return None
-
-
 def load_chunks(repo_path: Path):
-    """
-    Load chunks.json for a repository.
-    """
-
     chunks_file = chunks_path_for(repo_path)
 
     if not chunks_file.exists():
@@ -162,388 +144,8 @@ def load_chunks(repo_path: Path):
     return data.get("chunks", [])
 
 
-def remove_readonly(func, path, exc_info):
-    os.chmod(path, stat.S_IWRITE)
-    func(path)
-
-
 # ============================================================
-# INGEST
-# ============================================================
-
-def ingest_repo(repo_url: str):
-
-    repo_name = repo_url.rstrip("/").split("/")[-1]
-
-    if repo_name.endswith(".git"):
-        repo_name = repo_name[:-4]
-
-    dest = WORKSPACE_DIR / repo_name
-
-    if dest.exists():
-        shutil.rmtree(
-            dest,
-            onerror=remove_readonly
-        )
-
-    result = subprocess.run(
-        [
-            "git",
-            "clone",
-            "--depth",
-            "1",
-            repo_url,
-            str(dest)
-        ],
-        capture_output=True,
-        text=True,
-    )
-
-    if result.returncode != 0:
-        return {
-            "success": False,
-            "error": result.stderr
-        }
-
-    top_level = [
-        item.name
-        for item in dest.iterdir()
-        if item.name not in IGNORE_DIRS
-    ]
-
-    file_count = 0
-
-    for root, dirs, files in os.walk(dest):
-
-        dirs[:] = [
-            d
-            for d in dirs
-            if d not in IGNORE_DIRS
-        ]
-
-        file_count += len(files)
-
-    return {
-        "success": True,
-        "cloned_to": str(dest),
-        "top_level_items": sorted(top_level),
-        "file_count": file_count
-    }
-
-
-# ============================================================
-# ANALYZE
-# ============================================================
-
-def analyze_repo(repo_path: Path):
-
-    error = validate_repo_path(repo_path)
-
-    if error:
-        return {
-            "success": False,
-            "error": error
-        }
-
-    files_info = []
-    language_counts = {}
-    directories = set()
-
-    important_names = {
-        "README",
-        "README.md",
-        "README.txt",
-        "requirements.txt",
-        "package.json",
-        "pyproject.toml",
-        "setup.py",
-        "Dockerfile",
-        "docker-compose.yml",
-        "docker-compose.yaml",
-        ".env.example",
-        "Makefile",
-    }
-
-    important_files = []
-
-    for root, dirs, files in os.walk(repo_path):
-
-        dirs[:] = [
-            d
-            for d in dirs
-            if d not in IGNORE_DIRS
-        ]
-
-        current_root = Path(root)
-
-        if current_root != repo_path:
-
-            relative_dir = current_root.relative_to(
-                repo_path
-            )
-
-            directories.add(
-                str(relative_dir)
-            )
-
-        for filename in files:
-
-            file_path = current_root / filename
-
-            if filename in important_names:
-
-                relative_path = file_path.relative_to(
-                    repo_path
-                )
-
-                important_files.append(
-                    str(relative_path)
-                )
-
-            extension = file_path.suffix.lower()
-
-            if extension in CODE_EXTENSIONS:
-
-                relative_path = file_path.relative_to(
-                    repo_path
-                )
-
-                size = file_path.stat().st_size
-
-                files_info.append({
-                    "path": str(relative_path),
-                    "extension": extension,
-                    "size_bytes": size
-                })
-
-                language_counts[extension] = (
-                    language_counts.get(extension, 0) + 1
-                )
-
-    return {
-        "success": True,
-        "summary": {
-            "total_code_files": len(files_info),
-            "language_counts": language_counts,
-            "directory_count": len(directories),
-            "important_files": sorted(
-                important_files
-            )
-        },
-        "directories": sorted(directories),
-        "files": files_info
-    }
-
-
-# ============================================================
-# CHUNK
-# ============================================================
-
-def chunk_repo(repo_path: Path):
-
-    error = validate_repo_path(repo_path)
-
-    if error:
-        return {
-            "success": False,
-            "error": error
-        }
-
-    all_chunks = []
-    files_processed = 0
-    files_skipped = 0
-
-    for root, dirs, files in os.walk(repo_path):
-
-        dirs[:] = [
-            d
-            for d in dirs
-            if d not in IGNORE_DIRS
-        ]
-
-        for filename in files:
-
-            file_path = Path(root) / filename
-            extension = file_path.suffix.lower()
-
-            if extension not in CODE_EXTENSIONS:
-                files_skipped += 1
-                continue
-
-            # Current project chunks Python using AST.
-            if extension != ".py":
-                files_skipped += 1
-                continue
-
-            try:
-
-                content = file_path.read_text(
-                    encoding="utf-8",
-                    errors="ignore"
-                )
-
-                tree = ast.parse(content)
-                lines = content.splitlines()
-
-                relative_path = file_path.relative_to(
-                    repo_path
-                )
-
-                imports = []
-
-                for node in ast.walk(tree):
-
-                    if isinstance(node, ast.Import):
-
-                        for alias in node.names:
-                            imports.append(alias.name)
-
-                    elif isinstance(node, ast.ImportFrom):
-
-                        if node.module:
-                            imports.append(
-                                node.module
-                            )
-
-                imports = sorted(set(imports))
-
-                for node in ast.walk(tree):
-
-                    if not isinstance(
-                        node,
-                        (
-                            ast.FunctionDef,
-                            ast.AsyncFunctionDef,
-                            ast.ClassDef
-                        )
-                    ):
-                        continue
-
-                    start_line = node.lineno
-
-                    end_line = getattr(
-                        node,
-                        "end_lineno",
-                        node.lineno
-                    )
-
-                    chunk_content = "\n".join(
-                        lines[
-                            start_line - 1:end_line
-                        ]
-                    )
-
-                    if isinstance(node, ast.ClassDef):
-                        structure_type = "class"
-
-                    elif isinstance(
-                        node,
-                        ast.AsyncFunctionDef
-                    ):
-                        structure_type = "async_function"
-
-                    else:
-                        structure_type = "function"
-
-                    references = []
-
-                    for child in ast.walk(node):
-
-                        if isinstance(child, ast.Name):
-                            references.append(
-                                child.id
-                            )
-
-                        elif isinstance(
-                            child,
-                            ast.Attribute
-                        ):
-                            references.append(
-                                child.attr
-                            )
-
-                    references = sorted(
-                        set(references)
-                    )
-
-                    all_chunks.append({
-
-                        "chunk_id":
-                            len(all_chunks) + 1,
-
-                        "type":
-                            structure_type,
-
-                        "name":
-                            node.name,
-
-                        "file":
-                            str(relative_path),
-
-                        "language":
-                            "python",
-
-                        "imports":
-                            imports,
-
-                        "references":
-                            references,
-
-                        "start_line":
-                            start_line,
-
-                        "end_line":
-                            end_line,
-
-                        "content":
-                            chunk_content
-                    })
-
-                files_processed += 1
-
-            except SyntaxError:
-                files_skipped += 1
-
-            except Exception:
-                files_skipped += 1
-
-    chunks_file = chunks_path_for(repo_path)
-
-    with open(
-        chunks_file,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-        json.dump(
-            {
-                "repository":
-                    str(repo_path),
-
-                "total_chunks":
-                    len(all_chunks),
-
-                "chunks":
-                    all_chunks
-            },
-            f,
-            indent=2,
-            ensure_ascii=False
-        )
-
-    return {
-        "success": True,
-        "repository": str(repo_path),
-        "files_processed": files_processed,
-        "files_skipped": files_skipped,
-        "total_chunks": len(all_chunks),
-        "chunks_file": str(chunks_file),
-        "chunks": all_chunks
-    }
-
-
-# ============================================================
-# SHARED RETRIEVAL ENGINE
+# RETRIEVAL
 # ============================================================
 
 def score_chunks(
@@ -552,10 +154,8 @@ def score_chunks(
     top_k: int = 5
 ):
     """
-    Shared retrieval/scoring implementation.
-
-    This replaces the duplicated scoring logic previously found
-    in /retrieve, /context, /prompt, /ask, /investigate and /plan.
+    Shared retrieval/scoring logic used by:
+    retrieve, context, ask, investigate and plan.
     """
 
     query = query.strip().lower()
@@ -593,23 +193,22 @@ def score_chunks(
             chunk.get("references", [])
         ).lower()
 
+        searchable_fields = [
+            name,
+            file_path,
+            content,
+            imports,
+            references,
+        ]
+
         matched_words = []
 
         for word in query_words:
 
-            if word in name:
-                matched_words.append(word)
-
-            elif word in file_path:
-                matched_words.append(word)
-
-            elif word in content:
-                matched_words.append(word)
-
-            elif word in imports:
-                matched_words.append(word)
-
-            elif word in references:
+            if any(
+                word in field
+                for field in searchable_fields
+            ):
                 matched_words.append(word)
 
         matched_words = sorted(
@@ -621,7 +220,6 @@ def score_chunks(
 
         score = 0
 
-        # Exact / partial name matches.
         if query == name:
             score += 20
 
@@ -636,7 +234,6 @@ def score_chunks(
 
         score += name_matches * 8
 
-        # File matches.
         if query in file_path:
             score += 10
 
@@ -648,7 +245,6 @@ def score_chunks(
 
         score += file_matches * 4
 
-        # References.
         reference_matches = sum(
             1
             for word in query_words
@@ -657,7 +253,6 @@ def score_chunks(
 
         score += reference_matches * 5
 
-        # Imports.
         import_matches = sum(
             1
             for word in query_words
@@ -666,7 +261,6 @@ def score_chunks(
 
         score += import_matches * 3
 
-        # Content.
         content_matches = sum(
             1
             for word in query_words
@@ -675,7 +269,6 @@ def score_chunks(
 
         score += content_matches
 
-        # Prefer executable units slightly.
         if chunk_type in {
             "function",
             "async_function"
@@ -704,9 +297,9 @@ def score_chunks(
             )
 
         except Exception:
+
             line_count = 1
 
-        # Penalize enormous chunks.
         if line_count > 500:
             score -= 5
 
@@ -740,12 +333,7 @@ def score_chunks(
     return results[:top_k]
 
 
-# ============================================================
-# CONTEXT
-# ============================================================
-
 def build_context_from_chunks(results):
-
     context_parts = []
 
     for result in results:
@@ -778,216 +366,476 @@ CODE:
     return "\n---\n".join(context_parts)
 
 
+# ============================================================
+# INGEST
+# ============================================================
+
+def ingest_repo(repo_url: str):
+
+    repo_name = (
+        repo_url
+        .rstrip("/")
+        .split("/")[-1]
+    )
+
+    if repo_name.endswith(".git"):
+        repo_name = repo_name[:-4]
+
+    dest = WORKSPACE_DIR / repo_name
+
+    if dest.exists():
+
+        shutil.rmtree(
+            dest,
+            onerror=remove_readonly
+        )
+
+    result = subprocess.run(
+        [
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            repo_url,
+            str(dest)
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+
+        return {
+            "success": False,
+            "error": result.stderr
+        }
+
+    top_level = [
+        item.name
+        for item in dest.iterdir()
+        if item.name not in IGNORE_DIRS
+    ]
+
+    file_count = 0
+
+    for root, dirs, files in os.walk(dest):
+
+        dirs[:] = [
+            d
+            for d in dirs
+            if d not in IGNORE_DIRS
+        ]
+
+        file_count += len(files)
+
+    return {
+        "success": True,
+        "cloned_to": str(dest),
+        "top_level_items": sorted(top_level),
+        "file_count": file_count
+    }
+
+
+# ============================================================
+# ANALYZE
+# ============================================================
+
+def analyze_repo(repo_path: Path):
+
+    if not repo_path.exists():
+        return {
+            "success": False,
+            "error": "That path doesn't exist."
+        }
+
+    if not repo_path.is_dir():
+        return {
+            "success": False,
+            "error": "Repository path is not a directory."
+        }
+
+    files_info = []
+    language_counts = {}
+    directories = set()
+
+    important_names = {
+        "README",
+        "README.md",
+        "README.txt",
+        "requirements.txt",
+        "package.json",
+        "pyproject.toml",
+        "setup.py",
+        "Dockerfile",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        ".env.example",
+        "Makefile",
+    }
+
+    important_files = []
+
+    for root, dirs, files in os.walk(repo_path):
+
+        dirs[:] = [
+            d
+            for d in dirs
+            if d not in IGNORE_DIRS
+        ]
+
+        current_root = Path(root)
+
+        if current_root != repo_path:
+
+            directories.add(
+                str(
+                    current_root.relative_to(
+                        repo_path
+                    )
+                )
+            )
+
+        for filename in files:
+
+            file_path = current_root / filename
+
+            if filename in important_names:
+
+                important_files.append(
+                    str(
+                        file_path.relative_to(
+                            repo_path
+                        )
+                    )
+                )
+
+            extension = (
+                file_path.suffix.lower()
+            )
+
+            if extension in CODE_EXTENSIONS:
+
+                relative_path = (
+                    file_path.relative_to(
+                        repo_path
+                    )
+                )
+
+                files_info.append({
+                    "path": str(relative_path),
+                    "extension": extension,
+                    "size_bytes":
+                        file_path.stat().st_size
+                })
+
+                language_counts[
+                    extension
+                ] = (
+                    language_counts.get(
+                        extension,
+                        0
+                    ) + 1
+                )
+
+    return {
+        "success": True,
+        "summary": {
+            "total_code_files":
+                len(files_info),
+            "language_counts":
+                language_counts,
+            "directory_count":
+                len(directories),
+            "important_files":
+                sorted(important_files)
+        },
+        "directories":
+            sorted(directories),
+        "files":
+            files_info
+    }
+
+
+# ============================================================
+# CHUNK
+# ============================================================
+
+def chunk_repo(repo_path: Path):
+
+    if not repo_path.exists():
+        return {
+            "success": False,
+            "error": "Repository path doesn't exist."
+        }
+
+    if not repo_path.is_dir():
+        return {
+            "success": False,
+            "error": "Repository path is not a directory."
+        }
+
+    all_chunks = []
+    files_processed = 0
+    files_skipped = 0
+
+    for root, dirs, files in os.walk(repo_path):
+
+        dirs[:] = [
+            d
+            for d in dirs
+            if d not in IGNORE_DIRS
+        ]
+
+        for filename in files:
+
+            file_path = Path(root) / filename
+            extension = file_path.suffix.lower()
+
+            if extension not in CODE_EXTENSIONS:
+                files_skipped += 1
+                continue
+
+            # Current AST chunker supports Python.
+            if extension != ".py":
+                files_skipped += 1
+                continue
+
+            try:
+
+                content = file_path.read_text(
+                    encoding="utf-8",
+                    errors="ignore"
+                )
+
+                tree = ast.parse(content)
+                lines = content.splitlines()
+
+                relative_path = (
+                    file_path.relative_to(
+                        repo_path
+                    )
+                )
+
+                imports = []
+
+                for node in ast.walk(tree):
+
+                    if isinstance(
+                        node,
+                        ast.Import
+                    ):
+
+                        for alias in node.names:
+                            imports.append(
+                                alias.name
+                            )
+
+                    elif isinstance(
+                        node,
+                        ast.ImportFrom
+                    ):
+
+                        if node.module:
+                            imports.append(
+                                node.module
+                            )
+
+                imports = sorted(
+                    set(imports)
+                )
+
+                for node in ast.walk(tree):
+
+                    if not isinstance(
+                        node,
+                        (
+                            ast.FunctionDef,
+                            ast.AsyncFunctionDef,
+                            ast.ClassDef
+                        )
+                    ):
+                        continue
+
+                    start_line = node.lineno
+
+                    end_line = getattr(
+                        node,
+                        "end_lineno",
+                        node.lineno
+                    )
+
+                    chunk_content = "\n".join(
+                        lines[
+                            start_line - 1:
+                            end_line
+                        ]
+                    )
+
+                    if isinstance(
+                        node,
+                        ast.ClassDef
+                    ):
+                        structure_type = "class"
+
+                    elif isinstance(
+                        node,
+                        ast.AsyncFunctionDef
+                    ):
+                        structure_type = (
+                            "async_function"
+                        )
+
+                    else:
+                        structure_type = "function"
+
+                    references = []
+
+                    for child in ast.walk(node):
+
+                        if isinstance(
+                            child,
+                            ast.Name
+                        ):
+                            references.append(
+                                child.id
+                            )
+
+                        elif isinstance(
+                            child,
+                            ast.Attribute
+                        ):
+                            references.append(
+                                child.attr
+                            )
+
+                    references = sorted(
+                        set(references)
+                    )
+
+                    all_chunks.append({
+                        "chunk_id":
+                            len(all_chunks) + 1,
+                        "type":
+                            structure_type,
+                        "name":
+                            node.name,
+                        "file":
+                            str(relative_path),
+                        "language":
+                            "python",
+                        "imports":
+                            imports,
+                        "references":
+                            references,
+                        "start_line":
+                            start_line,
+                        "end_line":
+                            end_line,
+                        "content":
+                            chunk_content
+                    })
+
+                files_processed += 1
+
+            except SyntaxError:
+                files_skipped += 1
+
+            except Exception:
+                files_skipped += 1
+
+    chunks_file = chunks_path_for(repo_path)
+
+    with open(
+        chunks_file,
+        "w",
+        encoding="utf-8"
+    ) as f:
+
+        json.dump(
+            {
+                "repository":
+                    str(repo_path),
+                "total_chunks":
+                    len(all_chunks),
+                "chunks":
+                    all_chunks
+            },
+            f,
+            indent=2,
+            ensure_ascii=False
+        )
+
+    return {
+        "success": True,
+        "repository":
+            str(repo_path),
+        "files_processed":
+            files_processed,
+        "files_skipped":
+            files_skipped,
+        "total_chunks":
+            len(all_chunks),
+        "chunks_file":
+            str(chunks_file),
+        "chunks":
+            all_chunks
+    }
+
+
+# ============================================================
+# RETRIEVE
+# ============================================================
+
 def retrieve_chunks(
     repo_path: Path,
     query: str,
-    top_k: int
+    top_k: int = 5
 ):
 
-    error = validate_repo_path(repo_path)
+    chunks = load_chunks(repo_path)
 
-    if error:
-        return {
-            "success": False,
-            "error": error
-        }
+    results = score_chunks(
+        chunks,
+        query,
+        top_k
+    )
 
-    if not query.strip():
-        return {
-            "success": False,
-            "error": "Query cannot be empty."
-        }
+    return {
+        "success": True,
+        "query": query,
+        "match_count": len(results),
+        "results": results
+    }
 
-    try:
-        chunks = load_chunks(repo_path)
 
-        results = score_chunks(
-            chunks,
-            query,
-            top_k
-        )
-
-        return {
-            "success": True,
-            "query": query,
-            "match_count": len(results),
-            "results": results
-        }
-
-    except FileNotFoundError as e:
-
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-    except json.JSONDecodeError:
-
-        return {
-            "success": False,
-            "error": "chunks.json contains invalid JSON."
-        }
-
-    except Exception as e:
-
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
+# ============================================================
+# CONTEXT
+# ============================================================
 
 def build_context(
     repo_path: Path,
     query: str,
-    top_k: int
+    top_k: int = 5
 ):
 
-    error = validate_repo_path(repo_path)
+    chunks = load_chunks(repo_path)
 
-    if error:
-        return {
-            "success": False,
-            "error": error
-        }
+    results = score_chunks(
+        chunks,
+        query,
+        top_k
+    )
 
-    if not query.strip():
-        return {
-            "success": False,
-            "error": "Query cannot be empty."
-        }
+    context = build_context_from_chunks(
+        results
+    )
 
-    try:
-
-        chunks = load_chunks(repo_path)
-
-        results = score_chunks(
-            chunks,
-            query,
-            top_k
-        )
-
-        context = build_context_from_chunks(
-            results
-        )
-
-        return {
-            "success": True,
-            "query": query,
-            "chunk_count": len(results),
-            "context": context
-        }
-
-    except FileNotFoundError as e:
-
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-    except json.JSONDecodeError:
-
-        return {
-            "success": False,
-            "error": "chunks.json contains invalid JSON."
-        }
-
-    except Exception as e:
-
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-
-# ============================================================
-# PROMPT
-# ============================================================
-
-def build_prompt(
-    repo_path: Path,
-    question: str,
-    top_k: int
-):
-
-    error = validate_repo_path(repo_path)
-
-    if error:
-        return {
-            "success": False,
-            "error": error
-        }
-
-    question = question.strip()
-
-    if not question:
-        return {
-            "success": False,
-            "error": "Question cannot be empty."
-        }
-
-    try:
-
-        chunks = load_chunks(repo_path)
-
-        results = score_chunks(
-            chunks,
-            question,
-            top_k
-        )
-
-        context = build_context_from_chunks(
-            results
-        )
-
-        prompt = f"""You are an AI Codebase Engineer.
-
-Your job is to answer questions about a software
-repository using the provided code context.
-
-Rules:
-- Use the provided code context as your primary source.
-- Do not invent files, functions, classes, or behavior.
-- If the context does not contain enough information,
-  clearly say so.
-- Mention relevant file names when useful.
-- When you reference code, cite it inline like (file.py, lines 10-15).
-- Clearly separate what the code shows (evidence) from anything you are inferring.
-- Explain the code clearly and concisely.
-
-USER QUESTION:
-{question}
-
-CODEBASE CONTEXT:
-{context}
-"""
-
-        return {
-            "success": True,
-            "question": question,
-            "retrieved_chunks": len(results),
-            "prompt": prompt
-        }
-
-    except FileNotFoundError as e:
-
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-    except json.JSONDecodeError:
-
-        return {
-            "success": False,
-            "error": "chunks.json contains invalid JSON."
-        }
-
-    except Exception as e:
-
-        return {
-            "success": False,
-            "error": str(e)
-        }
+    return {
+        "success": True,
+        "query": query,
+        "chunk_count": len(results),
+        "context": context
+    }
 
 
 # ============================================================
@@ -997,40 +845,22 @@ CODEBASE CONTEXT:
 def ask_codebase(
     repo_path: Path,
     question: str,
-    top_k: int
+    top_k: int = 5
 ):
 
-    error = validate_repo_path(repo_path)
+    chunks = load_chunks(repo_path)
 
-    if error:
-        return {
-            "success": False,
-            "error": error
-        }
+    results = score_chunks(
+        chunks,
+        question,
+        top_k
+    )
 
-    question = question.strip()
+    context = build_context_from_chunks(
+        results
+    )
 
-    if not question:
-        return {
-            "success": False,
-            "error": "Question cannot be empty."
-        }
-
-    try:
-
-        chunks = load_chunks(repo_path)
-
-        results = score_chunks(
-            chunks,
-            question,
-            top_k
-        )
-
-        context = build_context_from_chunks(
-            results
-        )
-
-        prompt = f"""You are an AI Codebase Engineer.
+    prompt = f"""You are an AI Codebase Engineer.
 
 Your job is to answer questions about a software
 repository using the provided code context.
@@ -1041,8 +871,10 @@ Rules:
 - If the context does not contain enough information,
   clearly say so.
 - Mention relevant file names when useful.
-- When you reference code, cite it inline like (file.py, lines 10-15).
-- Clearly separate what the code shows (evidence) from anything you are inferring.
+- When you reference code, cite it inline like
+  (file.py, lines 10-15).
+- Clearly separate what the code shows from anything
+  you are inferring.
 - Explain the code clearly and concisely.
 
 USER QUESTION:
@@ -1052,44 +884,26 @@ CODEBASE CONTEXT:
 {context}
 """
 
-        response = call_gemini_with_retry(prompt)
+    response = call_gemini_with_retry(
+        prompt
+    )
 
-        answer = response.text
+    sources = [
+        result["chunk"]["file"]
+        for result in results
+    ]
 
-        sources = [
-            result["chunk"]["file"]
-            for result in results
-        ]
-
-        return {
-            "success": True,
-            "question": question,
-            "answer": answer,
-            "retrieved_chunks": len(results),
-            "model": GEMINI_MODEL,
-            "sources": sorted(set(sources))
-        }
-
-    except FileNotFoundError as e:
-
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-    except json.JSONDecodeError:
-
-        return {
-            "success": False,
-            "error": "chunks.json contains invalid JSON."
-        }
-
-    except Exception as e:
-
-        return {
-            "success": False,
-            "error": str(e)
-        }
+    return {
+        "success": True,
+        "question": question,
+        "answer": response.text,
+        "retrieved_chunks":
+            len(results),
+        "model":
+            GEMINI_MODEL,
+        "sources":
+            sorted(set(sources))
+    }
 
 
 # ============================================================
@@ -1101,45 +915,18 @@ def get_relationships(
     target_name: str
 ):
 
-    error = validate_repo_path(repo_path)
-
-    if error:
-        return {
-            "success": False,
-            "error": error
-        }
-
-    target_name = target_name.strip()
-
-    if not target_name:
-        return {
-            "success": False,
-            "error": "Name cannot be empty."
-        }
-
-    try:
-        chunks = load_chunks(repo_path)
-
-    except FileNotFoundError as e:
-
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-    except json.JSONDecodeError:
-
-        return {
-            "success": False,
-            "error": "chunks.json contains invalid JSON."
-        }
+    chunks = load_chunks(repo_path)
 
     defined_at = [
         {
-            "file": chunk.get("file"),
-            "type": chunk.get("type"),
-            "start_line": chunk.get("start_line"),
-            "end_line": chunk.get("end_line"),
+            "file":
+                chunk.get("file"),
+            "type":
+                chunk.get("type"),
+            "start_line":
+                chunk.get("start_line"),
+            "end_line":
+                chunk.get("end_line"),
         }
         for chunk in chunks
         if chunk.get("name") == target_name
@@ -1152,11 +939,17 @@ def get_relationships(
         if chunk.get("name") == target_name:
 
             depends_on.update(
-                chunk.get("references", [])
+                chunk.get(
+                    "references",
+                    []
+                )
             )
 
             depends_on.update(
-                chunk.get("imports", [])
+                chunk.get(
+                    "imports",
+                    []
+                )
             )
 
     used_by = []
@@ -1172,11 +965,16 @@ def get_relationships(
         ):
 
             used_by.append({
-                "name": chunk.get("name"),
-                "file": chunk.get("file"),
-                "type": chunk.get("type"),
-                "start_line": chunk.get("start_line"),
-                "end_line": chunk.get("end_line"),
+                "name":
+                    chunk.get("name"),
+                "file":
+                    chunk.get("file"),
+                "type":
+                    chunk.get("type"),
+                "start_line":
+                    chunk.get("start_line"),
+                "end_line":
+                    chunk.get("end_line"),
             })
 
     imported_in_files = sorted({
@@ -1192,72 +990,44 @@ def get_relationships(
         "success": True,
         "name": target_name,
         "defined_at": defined_at,
-        "depends_on": sorted(depends_on),
-        "used_by": used_by,
-        "imported_in_files": imported_in_files,
+        "depends_on":
+            sorted(depends_on),
+        "used_by":
+            used_by,
+        "imported_in_files":
+            imported_in_files,
     }
 
 
 # ============================================================
-# INVESTIGATION
+# INVESTIGATE
 # ============================================================
 
 def investigate_bug(
     repo_path: Path,
     bug_description: str,
-    top_k: int
+    top_k: int = 5
 ):
 
-    error = validate_repo_path(repo_path)
+    chunks = load_chunks(repo_path)
 
-    if error:
-        return {
-            "success": False,
-            "error": error
-        }
-
-    bug_description = bug_description.strip()
-
-    if not bug_description:
-        return {
-            "success": False,
-            "error": "bug_description cannot be empty."
-        }
-
-    try:
-
-        chunks = load_chunks(repo_path)
-
-        results = score_chunks(
-            chunks,
-            bug_description,
-            top_k
-        )
-
-    except FileNotFoundError as e:
-
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-    except json.JSONDecodeError:
-
-        return {
-            "success": False,
-            "error": "chunks.json contains invalid JSON."
-        }
+    results = score_chunks(
+        chunks,
+        bug_description,
+        top_k
+    )
 
     if not results:
 
         return {
             "success": True,
-            "bug_description": bug_description,
-            "investigation": (
-                "No relevant code was found for this bug description. "
-                "Try describing it with terms more likely to appear in "
-                "the code (function names, error messages, feature names)."
-            ),
+            "bug_description":
+                bug_description,
+            "investigation":
+                (
+                    "No relevant code was found "
+                    "for this bug description."
+                ),
             "retrieved_chunks": 0,
             "related_symbols": [],
             "sources": [],
@@ -1271,7 +1041,10 @@ def investigate_bug(
         chunk = result["chunk"]
         name = chunk.get("name")
 
-        if not name or name in related_symbol_names:
+        if not name:
+            continue
+
+        if name in related_symbol_names:
             continue
 
         related_symbol_names.add(name)
@@ -1291,7 +1064,8 @@ def investigate_bug(
         if used_by:
 
             related_notes.append(
-                f"{name} (in {chunk.get('file')}) "
+                f"{name} "
+                f"(in {chunk.get('file')}) "
                 f"is used by: "
                 f"{', '.join(sorted(set(used_by))[:5])}"
             )
@@ -1299,10 +1073,8 @@ def investigate_bug(
     related_context = (
         "\n".join(related_notes)
         if related_notes
-        else (
-            "No cross-references found among "
-            "the retrieved code."
-        )
+        else
+        "No cross-references found."
     )
 
     context = build_context_from_chunks(
@@ -1311,9 +1083,10 @@ def investigate_bug(
 
     prompt = f"""You are an AI Codebase Engineer investigating a reported bug.
 
-Use ONLY the code shown below. Do not invent files, functions, or
-behavior that isn't shown. If the code doesn't support a conclusion,
-say so honestly instead of guessing.
+Use ONLY the code shown below.
+
+Do not invent files, functions, or behavior that
+isn't shown.
 
 Respond in exactly this structure:
 
@@ -1335,24 +1108,13 @@ BUG DESCRIPTION:
 RELEVANT CODE:
 {context}
 
-CROSS-REFERENCES (what else touches this code):
+CROSS-REFERENCES:
 {related_context}
 """
 
-    try:
-
-        response = call_gemini_with_retry(
-            prompt
-        )
-
-        investigation = response.text
-
-    except Exception as e:
-
-        return {
-            "success": False,
-            "error": f"LLM call failed: {e}"
-        }
+    response = call_gemini_with_retry(
+        prompt
+    )
 
     sources = sorted({
         result["chunk"]["file"]
@@ -1361,79 +1123,52 @@ CROSS-REFERENCES (what else touches this code):
 
     return {
         "success": True,
-        "bug_description": bug_description,
-        "investigation": investigation,
-        "retrieved_chunks": len(results),
-        "related_symbols": sorted(
-            related_symbol_names
-        ),
-        "sources": sources,
-        "model": GEMINI_MODEL,
+        "bug_description":
+            bug_description,
+        "investigation":
+            response.text,
+        "retrieved_chunks":
+            len(results),
+        "related_symbols":
+            sorted(
+                related_symbol_names
+            ),
+        "sources":
+            sources,
+        "model":
+            GEMINI_MODEL,
     }
 
 
 # ============================================================
-# FEATURE PLANNING
+# PLAN
 # ============================================================
 
 def plan_feature(
     repo_path: Path,
     feature_request: str,
-    top_k: int
+    top_k: int = 5
 ):
 
-    error = validate_repo_path(repo_path)
+    chunks = load_chunks(repo_path)
 
-    if error:
-        return {
-            "success": False,
-            "error": error
-        }
-
-    feature_request = feature_request.strip()
-
-    if not feature_request:
-        return {
-            "success": False,
-            "error": "feature_request cannot be empty."
-        }
-
-    try:
-
-        chunks = load_chunks(repo_path)
-
-        results = score_chunks(
-            chunks,
-            feature_request,
-            top_k
-        )
-
-    except FileNotFoundError as e:
-
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-    except json.JSONDecodeError:
-
-        return {
-            "success": False,
-            "error": "chunks.json contains invalid JSON."
-        }
+    results = score_chunks(
+        chunks,
+        feature_request,
+        top_k
+    )
 
     if not results:
 
         return {
             "success": True,
-            "feature_request": feature_request,
-            "plan": (
-                "No closely related existing code was found for "
-                "this feature request. This may mean it's a "
-                "genuinely new capability with little to build on, "
-                "or that it needs to be described using terms "
-                "closer to the actual code."
-            ),
+            "feature_request":
+                feature_request,
+            "plan":
+                (
+                    "No closely related existing "
+                    "code was found."
+                ),
             "retrieved_chunks": 0,
             "related_symbols": [],
             "sources": [],
@@ -1447,7 +1182,10 @@ def plan_feature(
         chunk = result["chunk"]
         name = chunk.get("name")
 
-        if not name or name in related_symbol_names:
+        if not name:
+            continue
+
+        if name in related_symbol_names:
             continue
 
         related_symbol_names.add(name)
@@ -1467,31 +1205,30 @@ def plan_feature(
         if used_by:
 
             related_notes.append(
-                f"{name} (in {chunk.get('file')}) "
+                f"{name} "
+                f"(in {chunk.get('file')}) "
                 f"is used by: "
-                f"{', '.join(sorted(set(used_by))[:5])} "
-                f"— changing it could affect these too."
+                f"{', '.join(sorted(set(used_by))[:5])}"
             )
 
     related_context = (
         "\n".join(related_notes)
         if related_notes
-        else (
-            "No cross-references found among "
-            "the retrieved code."
-        )
+        else
+        "No cross-references found."
     )
 
     context = build_context_from_chunks(
         results
     )
 
-    prompt = f"""You are an AI Codebase Engineer, planning a new feature
+    prompt = f"""You are an AI Codebase Engineer planning a new feature
 before any code is written.
 
-Use ONLY the code shown below. Do not invent files, functions, or
-behavior that isn't shown. If the codebase context isn't enough to
-plan this confidently, say so honestly instead of guessing.
+Use ONLY the code shown below.
+
+Do not invent files, functions, or behavior
+that isn't shown.
 
 Respond in exactly this structure:
 
@@ -1499,13 +1236,13 @@ AFFECTED FILES:
 <files/functions this feature would likely touch, and why>
 
 PROPOSED CHANGES:
-<a concrete outline of what would need to change, cited inline like (file.py, lines X-Y) where relevant>
+<a concrete outline of what would need to change, cited inline like (file.py, lines X-Y)>
 
 RISKS:
-<what could break, edge cases, or existing behavior to be careful of — use the cross-references below>
+<what could break or edge cases to consider>
 
 TESTS TO CONSIDER:
-<what should be tested to confirm this works and nothing else broke>
+<what should be tested>
 
 FEATURE REQUEST:
 {feature_request}
@@ -1513,24 +1250,13 @@ FEATURE REQUEST:
 RELEVANT EXISTING CODE:
 {context}
 
-CROSS-REFERENCES (what else touches this code):
+CROSS-REFERENCES:
 {related_context}
 """
 
-    try:
-
-        response = call_gemini_with_retry(
-            prompt
-        )
-
-        plan = response.text
-
-    except Exception as e:
-
-        return {
-            "success": False,
-            "error": f"LLM call failed: {e}"
-        }
+    response = call_gemini_with_retry(
+        prompt
+    )
 
     sources = sorted({
         result["chunk"]["file"]
@@ -1539,14 +1265,20 @@ CROSS-REFERENCES (what else touches this code):
 
     return {
         "success": True,
-        "feature_request": feature_request,
-        "plan": plan,
-        "retrieved_chunks": len(results),
-        "related_symbols": sorted(
-            related_symbol_names
-        ),
-        "sources": sources,
-        "model": GEMINI_MODEL,
+        "feature_request":
+            feature_request,
+        "plan":
+            response.text,
+        "retrieved_chunks":
+            len(results),
+        "related_symbols":
+            sorted(
+                related_symbol_names
+            ),
+        "sources":
+            sources,
+        "model":
+            GEMINI_MODEL,
     }
 
 
@@ -1555,16 +1287,12 @@ CROSS-REFERENCES (what else touches this code):
 # ============================================================
 
 def strip_code_fence(text: str) -> str:
-    """
-    Remove a single markdown code fence if Gemini adds one.
-    """
 
     check = text.strip()
 
     if check.startswith("```"):
 
         lines = check.split("\n")
-
         lines = lines[1:]
 
         if (
@@ -1584,29 +1312,14 @@ def propose_change(
     instruction: str
 ):
 
-    error = validate_repo_path(repo_path)
-
-    if error:
-        return {
-            "success": False,
-            "error": error
-        }
-
-    instruction = instruction.strip()
-
-    if not instruction:
-        return {
-            "success": False,
-            "error": "instruction cannot be empty."
-        }
-
-    repo_path_resolved = repo_path.resolve()
+    repo_path_resolved = (
+        repo_path.resolve()
+    )
 
     target_file = (
         repo_path / file_path
     ).resolve()
 
-    # Security check.
     try:
 
         target_file.relative_to(
@@ -1617,55 +1330,56 @@ def propose_change(
 
         return {
             "success": False,
-            "error": (
-                "file_path escapes the repository "
-                "folder — refusing."
-            )
+            "error":
+                "file_path escapes the repository folder."
         }
 
     if not target_file.exists():
 
         return {
             "success": False,
-            "error": f"File not found: {file_path}"
+            "error":
+                f"File not found: {file_path}"
         }
 
     if not target_file.is_file():
 
         return {
             "success": False,
-            "error": "file_path is not a file."
+            "error":
+                "file_path is not a file."
         }
 
     try:
 
-        original_content = target_file.read_text(
-            encoding="utf-8"
+        original_content = (
+            target_file.read_text(
+                encoding="utf-8"
+            )
         )
 
     except UnicodeDecodeError:
 
         return {
             "success": False,
-            "error": (
-                "This file is not a readable text file."
-            )
+            "error":
+                "This file is not readable text."
         }
 
     prompt = f"""You are an AI Codebase Engineer making a single, focused code change.
 
-You will be given the CURRENT content of one file and an instruction
-describing what to change.
+Output ONLY the complete updated file content.
 
 Rules:
-- Output ONLY the complete, updated file content.
-- Do NOT include markdown code fences, explanations, or commentary.
-- Do NOT change anything unrelated to the instruction.
-- Preserve existing formatting, comments, and style.
-- If the instruction cannot be safely applied, output the original
-  content UNCHANGED and nothing else.
+- Do not include markdown fences.
+- Do not include explanations.
+- Do not change unrelated code.
+- Preserve formatting and comments.
+- If the instruction cannot safely be applied,
+  return the original content unchanged.
 
-FILE: {file_path}
+FILE:
+{file_path}
 
 INSTRUCTION:
 {instruction}
@@ -1674,22 +1388,13 @@ CURRENT FILE CONTENT:
 {original_content}
 """
 
-    try:
+    response = call_gemini_with_retry(
+        prompt
+    )
 
-        response = call_gemini_with_retry(
-            prompt
-        )
-
-        proposed_content = strip_code_fence(
-            response.text
-        )
-
-    except Exception as e:
-
-        return {
-            "success": False,
-            "error": f"LLM call failed: {e}"
-        }
+    proposed_content = strip_code_fence(
+        response.text
+    )
 
     diff_lines = list(
         difflib.unified_diff(
@@ -1699,25 +1404,31 @@ CURRENT FILE CONTENT:
             proposed_content.splitlines(
                 keepends=True
             ),
-            fromfile=f"{file_path} (current)",
-            tofile=f"{file_path} (proposed)",
+            fromfile=
+                f"{file_path} (current)",
+            tofile=
+                f"{file_path} (proposed)",
         )
     )
 
-    diff_text = "".join(diff_lines)
+    diff_text = "".join(
+        diff_lines
+    )
 
     if not diff_text.strip():
 
         return {
             "success": True,
-            "file_path": file_path,
-            "instruction": instruction,
-            "changed": False,
-            "message": (
-                "The model did not propose any "
-                "change to this file."
-            ),
-            "diff": "",
+            "file_path":
+                file_path,
+            "instruction":
+                instruction,
+            "changed":
+                False,
+            "message":
+                "No change proposed.",
+            "diff":
+                "",
         }
 
     safe_name = (
@@ -1728,7 +1439,8 @@ CURRENT FILE CONTENT:
 
     proposal_file = (
         PROPOSED_CHANGES_DIR
-        / f"{repo_path.name}__{safe_name}.proposed"
+        /
+        f"{repo_path.name}__{safe_name}.proposed"
     )
 
     proposal_file.write_text(
@@ -1738,235 +1450,195 @@ CURRENT FILE CONTENT:
 
     return {
         "success": True,
-        "file_path": file_path,
-        "instruction": instruction,
-        "changed": True,
-        "diff": diff_text,
-        "proposed_file_saved_to": str(
-            proposal_file
-        ),
-        "model": GEMINI_MODEL,
+        "file_path":
+            file_path,
+        "instruction":
+            instruction,
+        "changed":
+            True,
+        "diff":
+            diff_text,
+        "proposed_file_saved_to":
+            str(proposal_file),
+        "model":
+            GEMINI_MODEL,
     }
 
 
 # ============================================================
-# DAY 12 — TEST DETECTION
+# DAY 13 — END-TO-END ENGINEER WORKFLOW
 # ============================================================
 
-def detect_tests(repo_path: Path):
+def engineer_workflow(
+    repo_url: str,
+    task_type: str,
+    question: str,
+    top_k: int = 5
+):
+    """
+    Complete Day 13 pipeline.
 
-    error = validate_repo_path(repo_path)
+    1. Clone repository
+    2. Chunk repository
+    3. Retrieve relevant code
+    4. Ask / investigate / plan
+    5. Return everything in one response
+    """
 
-    if error:
+    # --------------------------------------------------------
+    # STEP 1 — INGEST
+    # --------------------------------------------------------
+
+    ingest_result = ingest_repo(
+        repo_url
+    )
+
+    if not ingest_result.get("success"):
+
         return {
             "success": False,
-            "error": error
+            "stage": "ingest",
+            "error":
+                ingest_result.get(
+                    "error",
+                    "Repository ingestion failed."
+                ),
+            "ingest": ingest_result
+        }
+
+    repo_path = Path(
+        ingest_result["cloned_to"]
+    )
+
+    # --------------------------------------------------------
+    # STEP 2 — CHUNK
+    # --------------------------------------------------------
+
+    chunk_result = chunk_repo(
+        repo_path
+    )
+
+    if not chunk_result.get("success"):
+
+        return {
+            "success": False,
+            "stage": "chunk",
+            "error":
+                chunk_result.get(
+                    "error",
+                    "Repository chunking failed."
+                ),
+            "ingest": ingest_result,
+            "chunk": chunk_result
         }
 
     # --------------------------------------------------------
-    # Python / pytest
+    # STEP 3 — RUN THE REQUESTED AI OPERATION
     # --------------------------------------------------------
 
-    pytest_files = []
+    if task_type == "ask":
 
-    for root, dirs, files in os.walk(repo_path):
+        ai_result = ask_codebase(
+            repo_path,
+            question,
+            top_k
+        )
 
-        dirs[:] = [
-            d
-            for d in dirs
-            if d not in IGNORE_DIRS
-        ]
+    elif task_type == "investigate":
 
-        for filename in files:
+        ai_result = investigate_bug(
+            repo_path,
+            question,
+            top_k
+        )
 
-            lower_name = filename.lower()
+    elif task_type == "plan":
 
-            if (
-                lower_name.startswith("test_")
-                and lower_name.endswith(".py")
-            ) or (
-                lower_name.endswith("_test.py")
-            ):
+        ai_result = plan_feature(
+            repo_path,
+            question,
+            top_k
+        )
 
-                pytest_files.append(
-                    str(
-                        Path(root)
-                        .joinpath(filename)
-                        .relative_to(repo_path)
+    else:
+
+        return {
+            "success": False,
+            "stage": "task",
+            "error":
+                (
+                    "task_type must be "
+                    "'ask', 'investigate', "
+                    "or 'plan'."
+                ),
+            "ingest": ingest_result,
+            "chunk": {
+                "success": True,
+                "total_chunks":
+                    chunk_result.get(
+                        "total_chunks",
+                        0
                     )
-                )
-
-    if pytest_files:
-
-        return {
-            "success": True,
-            "repository": str(repo_path),
-            "detected": True,
-            "framework": "pytest",
-            "command": "pytest",
-            "test_files": sorted(pytest_files)
+            }
         }
 
     # --------------------------------------------------------
-    # package.json / npm
+    # STEP 4 — RETURN COMPLETE PIPELINE RESULT
     # --------------------------------------------------------
-
-    package_json = repo_path / "package.json"
-
-    if package_json.exists():
-
-        try:
-
-            with open(
-                package_json,
-                "r",
-                encoding="utf-8"
-            ) as f:
-
-                package_data = json.load(f)
-
-            scripts = package_data.get(
-                "scripts",
-                {}
-            )
-
-            if "test" in scripts:
-
-                return {
-                    "success": True,
-                    "repository": str(repo_path),
-                    "detected": True,
-                    "framework": "npm",
-                    "command": "npm test"
-                }
-
-        except Exception:
-            pass
-
-    # --------------------------------------------------------
-    # unittest
-    # --------------------------------------------------------
-
-    unittest_files = []
-
-    for root, dirs, files in os.walk(repo_path):
-
-        dirs[:] = [
-            d
-            for d in dirs
-            if d not in IGNORE_DIRS
-        ]
-
-        for filename in files:
-
-            if (
-                filename.endswith(".py")
-                and (
-                    filename.startswith("test")
-                    or filename.endswith("_test.py")
-                )
-            ):
-
-                unittest_files.append(filename)
-
-    if unittest_files:
-
-        return {
-            "success": True,
-            "repository": str(repo_path),
-            "detected": True,
-            "framework": "python-tests",
-            "command": "python -m unittest discover"
-        }
 
     return {
         "success": True,
-        "repository": str(repo_path),
-        "detected": False,
-        "framework": None,
-        "command": None
+
+        "workflow": [
+            "ingest",
+            "chunk",
+            task_type
+        ],
+
+        "repository": {
+            "url": repo_url,
+            "path": str(repo_path)
+        },
+
+        "ingest": {
+            "success":
+                ingest_result.get(
+                    "success"
+                ),
+            "file_count":
+                ingest_result.get(
+                    "file_count"
+                ),
+            "top_level_items":
+                ingest_result.get(
+                    "top_level_items"
+                )
+        },
+
+        "chunk": {
+            "success":
+                chunk_result.get(
+                    "success"
+                ),
+            "files_processed":
+                chunk_result.get(
+                    "files_processed"
+                ),
+            "files_skipped":
+                chunk_result.get(
+                    "files_skipped"
+                ),
+            "total_chunks":
+                chunk_result.get(
+                    "total_chunks"
+                )
+        },
+
+        "task": {
+            "type": task_type,
+            "question": question,
+            "top_k": top_k
+        },
+
+        "result": ai_result
     }
-
-
-# ============================================================
-# DAY 12 — VALIDATION
-# ============================================================
-
-def validate_repository(repo_path: Path):
-
-    error = validate_repo_path(repo_path)
-
-    if error:
-        return {
-            "success": False,
-            "error": error
-        }
-
-    detection = detect_tests(repo_path)
-
-    if not detection.get("detected"):
-
-        return {
-            "success": True,
-            "validated": False,
-            "passed": False,
-            "message": (
-                "No supported test framework was detected."
-            ),
-            "repository": str(repo_path)
-        }
-
-    command = detection.get("command")
-
-    try:
-
-        completed = subprocess.run(
-            command,
-            cwd=str(repo_path),
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-
-        passed = completed.returncode == 0
-
-        return {
-            "success": True,
-            "validated": True,
-            "passed": passed,
-            "framework": detection.get(
-                "framework"
-            ),
-            "command": command,
-            "return_code": completed.returncode,
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
-            "repository": str(repo_path)
-        }
-
-    except subprocess.TimeoutExpired as e:
-
-        return {
-            "success": True,
-            "validated": True,
-            "passed": False,
-            "framework": detection.get(
-                "framework"
-            ),
-            "command": command,
-            "error": (
-                "Test execution timed out "
-                "after 300 seconds."
-            ),
-            "stdout": e.stdout,
-            "stderr": e.stderr,
-            "repository": str(repo_path)
-        }
-
-    except Exception as e:
-
-        return {
-            "success": False,
-            "error": str(e)
-        }
