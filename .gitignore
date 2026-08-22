@@ -1,6 +1,7 @@
-.venv/
+.env
 __pycache__/
 *.pyc
+.venv/
 backend/workspace/
-backend/.env
-backend/data
+backend/data/
+backend/proposed_changes/

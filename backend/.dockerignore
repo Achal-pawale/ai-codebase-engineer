@@ -1,0 +1,14 @@
+.venv
+__pycache__
+.pytest_cache
+.git
+.gitignore
+.env
+
+workspace
+data
+proposed_changes
+
+tests
+*.pyc
+*.log
