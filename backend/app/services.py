@@ -1772,6 +1772,38 @@ def validate_repository(
     )
 
     try:
+        # Install project dependencies before running tests
+        installers = []
+
+        if (repo_path / "pyproject.toml").exists():
+            installers.append(["pip", "install", "-e", ".[dev,test,testing,tests]", "--quiet"])
+            installers.append(["pip", "install", "-e", ".", "--quiet"])
+
+        if (repo_path / "setup.py").exists():
+            installers.append(["pip", "install", "-e", ".", "--quiet"])
+
+        if (repo_path / "requirements-test.txt").exists():
+            installers.append(["pip", "install", "-r", "requirements-test.txt", "--quiet"])
+
+        if (repo_path / "requirements-dev.txt").exists():
+            installers.append(["pip", "install", "-r", "requirements-dev.txt", "--quiet"])
+
+        if (repo_path / "requirements.txt").exists():
+            installers.append(["pip", "install", "-r", "requirements.txt", "--quiet"])
+
+        if (repo_path / "package.json").exists():
+            installers.append(["npm", "install", "--prefer-offline"])
+
+        for install_cmd in installers:
+            try:
+                subprocess.run(
+                    install_cmd,
+                    cwd=repo_path,
+                    capture_output=True,
+                    timeout=120,
+                )
+            except Exception:
+                pass
 
         if command == "python -m pytest":
             cmd = [

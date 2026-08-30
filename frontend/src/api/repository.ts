@@ -15,7 +15,7 @@ export function checkBackendHealth(): Promise<{ status: string }> {
 
 /** POST /ingest — clones the repo (shallow) into the backend's workspace dir. */
 export function ingestRepository(repoUrl: string): Promise<IngestResponse> {
-  return apiClient.post("/ingest", { repo_url: repoUrl }, { timeoutMs: 180_000 });  // was 60_000
+  return apiClient.post("/ingest", { repo_url: repoUrl }, { timeoutMs: 600_000 });  // was 60_000
 }
 
 export function analyzeRepository(clonedTo: string): Promise<AnalyzeResponse> {
