@@ -1,5 +1,7 @@
 import logging
 import os
+import threading
+import time
 from pathlib import Path
 from typing import Literal
 
@@ -109,6 +111,58 @@ app.add_middleware(
     ],
 )
 
+# ============================================================
+# METRICS (request count, errors, latency per endpoint)
+# ============================================================
+
+_metrics_lock = threading.Lock()
+_metrics = {}
+_metrics_started_at = time.time()
+
+
+@app.middleware("http")
+async def record_metrics(request: Request, call_next):
+    start = time.perf_counter()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    finally:
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        key = f"{request.method} {request.url.path}"
+        with _metrics_lock:
+            entry = _metrics.setdefault(
+                key,
+                {"count": 0, "errors": 0, "total_ms": 0.0, "max_ms": 0.0},
+            )
+            entry["count"] += 1
+            entry["total_ms"] += elapsed_ms
+            entry["max_ms"] = max(entry["max_ms"], elapsed_ms)
+            if status_code >= 400:
+                entry["errors"] += 1
+
+
+@app.get("/metrics")
+def metrics():
+    with _metrics_lock:
+        endpoints = {
+            key: {
+                "count": value["count"],
+                "errors": value["errors"],
+                "avg_latency_ms": round(value["total_ms"] / value["count"], 2),
+                "max_latency_ms": round(value["max_ms"], 2),
+            }
+            for key, value in _metrics.items()
+        }
+    total = sum(v["count"] for v in endpoints.values())
+    total_errors = sum(v["errors"] for v in endpoints.values())
+    return {
+        "uptime_seconds": round(time.time() - _metrics_started_at, 1),
+        "total_requests": total,
+        "total_errors": total_errors,
+        "endpoints": endpoints,
+    }
 
 # ============================================================
 # REQUEST MODELS

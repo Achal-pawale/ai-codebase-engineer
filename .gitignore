@@ -5,3 +5,6 @@ __pycache__/
 backend/workspace/
 backend/data/
 backend/proposed_changes/
+venv/
+.pytest_cache/
+.coverage
